@@ -1,0 +1,6 @@
+[tools]
+rust = "stable"
+
+[env]
+RUST_BACKTRACE = "1"
+# AWS credentials can be configured here or in the environment.

@@ -1,0 +1,25 @@
+[package]
+name = "edgeview"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Data analysis
+datafusion = { version = "52.2", default-features = false, features = ["parquet", "compression", "zstd", "sql", "datetime_expressions"] }
+object_store = { version = "0.12", features = ["aws"] }
+tokio = { version = "1", features = ["full"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+# CLI & Config
+clap = { version = "4.4", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+
+# Parsing & Utils
+regex = "1.10"
+quick-xml = { version = "0.31", features = ["serialize"] }
+anyhow = "1.0"
+url = "2.5"
+
+[dev-dependencies]
+tempfile = "3.8"
