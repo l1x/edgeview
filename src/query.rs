@@ -147,7 +147,79 @@ impl QueryEngine {
         Ok(results)
     }
 
-    pub async fn top_pages(&self) -> anyhow::Result<Vec<PageHits>> {
+    pub async fn bot_hits_by_path(&self, bot_map: &HashMap<String, String>) -> anyhow::Result<HashMap<String, u64>> {
+        if bot_map.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let like_clauses: Vec<String> = bot_map.keys()
+            .map(|pattern| format!("\"cs_User_Agent\" LIKE '%{}%'", pattern.replace('\'', "''")))
+            .collect();
+        let where_bots = like_clauses.join(" OR ");
+
+        let sql = format!(
+            "SELECT cs_uri_stem, COUNT(*) as bot_hits \
+             FROM logs \
+             WHERE cs_method = 'GET' \
+               AND sc_status IN ('200', '304') \
+               AND ({}) \
+             GROUP BY cs_uri_stem",
+            where_bots
+        );
+
+        let df = self.ctx.sql(&sql).await?;
+        let batches = df.collect().await?;
+        let mut results = HashMap::new();
+
+        for batch in batches {
+            let path_col = batch.column(0).as_any().downcast_ref::<StringArray>()
+                .ok_or_else(|| anyhow::anyhow!("Failed to downcast path column"))?;
+            let hits_col = batch.column(1).as_any().downcast_ref::<Int64Array>()
+                .ok_or_else(|| anyhow::anyhow!("Failed to downcast hits column"))?;
+
+            for i in 0..batch.num_rows() {
+                results.insert(path_col.value(i).to_string(), hits_col.value(i) as u64);
+            }
+        }
+
+        info!(paths = results.len(), "Computed bot hits by path");
+        Ok(results)
+    }
+
+    pub async fn bot_summary(&self, bot_map: &HashMap<String, String>) -> anyhow::Result<(u64, u64)> {
+        if bot_map.is_empty() {
+            return Ok((0, 0));
+        }
+
+        let like_clauses: Vec<String> = bot_map.keys()
+            .map(|pattern| format!("\"cs_User_Agent\" LIKE '%{}%'", pattern.replace('\'', "''")))
+            .collect();
+        let where_bots = like_clauses.join(" OR ");
+
+        let sql = format!(
+            "SELECT COUNT(*) as bot_hits, COUNT(DISTINCT c_ip) as bot_visitors \
+             FROM logs \
+             WHERE cs_method = 'GET' \
+               AND sc_status IN ('200', '304') \
+               AND ({})",
+            where_bots
+        );
+
+        let df = self.ctx.sql(&sql).await?;
+        let batches = df.collect().await?;
+        if let Some(batch) = batches.first() {
+            let hits = batch.column(0).as_any().downcast_ref::<Int64Array>()
+                .ok_or_else(|| anyhow::anyhow!("Failed to downcast bot_hits column"))?;
+            let visitors = batch.column(1).as_any().downcast_ref::<Int64Array>()
+                .ok_or_else(|| anyhow::anyhow!("Failed to downcast bot_visitors column"))?;
+            if batch.num_rows() > 0 {
+                return Ok((hits.value(0) as u64, visitors.value(0) as u64));
+            }
+        }
+        Ok((0, 0))
+    }
+
+    pub async fn top_pages(&self, bot_hits_by_path: &HashMap<String, u64>) -> anyhow::Result<Vec<PageHits>> {
         let df = self.ctx.sql("
             SELECT
                 cs_uri_stem as path,
@@ -180,21 +252,24 @@ impl QueryEngine {
             }
         }
 
-        // Classify and roll up paths
-        let mut rollup: HashMap<(String, String), (u64, u64)> = HashMap::new();
+        // Classify and roll up paths (including bot hits)
+        let mut rollup: HashMap<(String, String), (u64, u64, u64)> = HashMap::new();
         for (path, hits, visitors) in &raw {
             let (category, display_path) = classify_path(path);
-            let entry = rollup.entry((category.to_string(), display_path)).or_insert((0, 0));
+            let bot_hits = bot_hits_by_path.get(path.as_str()).copied().unwrap_or(0);
+            let entry = rollup.entry((category.to_string(), display_path)).or_insert((0, 0, 0));
             entry.0 += hits;
             entry.1 += visitors;
+            entry.2 += bot_hits;
         }
 
         let mut results: Vec<PageHits> = rollup
             .into_iter()
-            .map(|((category, path), (hits, visitors))| PageHits {
+            .map(|((category, path), (hits, visitors, bot_hits))| PageHits {
                 path,
                 hits,
                 visitors,
+                bot_hits,
                 category,
             })
             .collect();

@@ -52,13 +52,17 @@ async fn process_site(
         info!(domain = %site.domain, "Analyzing traffic from S3");
         let (total_hits, total_visitors) = engine.summary().await?;
         let daily = engine.daily_traffic().await?;
-        let top_pages = engine.top_pages().await?;
+        let bot_path_hits = engine.bot_hits_by_path(bots).await?;
+        let (total_bot_hits, total_bot_visitors) = engine.bot_summary(bots).await?;
+        let top_pages = engine.top_pages(&bot_path_hits).await?;
         let bot_stats = engine.bot_activity(bots).await?;
         let google_hits = engine.googlebot_hits().await?;
 
         let report = MonthReport {
             total_hits,
             total_visitors,
+            total_bot_hits,
+            total_bot_visitors,
             daily,
             top_pages,
             bot_stats,
@@ -105,9 +109,14 @@ async fn process_site(
     let mut doc = SvgDoc::new(800.0, GREY_ORANGE);
     doc.add_section_title(&format!("Traffic Report: {} ({})", site.domain, month));
 
+    let hits_bot_pct = if report.total_hits > 0 { (report.total_bot_hits * 100) / report.total_hits } else { 0 };
+    let hits_human_pct = 100 - hits_bot_pct;
+    let vis_bot_pct = if report.total_visitors > 0 { (report.total_bot_visitors * 100) / report.total_visitors } else { 0 };
+    let vis_human_pct = 100 - vis_bot_pct;
+
     doc.add_kpi_cards(&[
-        Kpi { label: "Total Hits".to_string(), value: report.total_hits.to_string(), change: None },
-        Kpi { label: "Unique Visitors".to_string(), value: report.total_visitors.to_string(), change: None },
+        Kpi { label: "Total Hits".to_string(), value: report.total_hits.to_string(), change: Some(format!("{}% human · {}% bot", hits_human_pct, hits_bot_pct)) },
+        Kpi { label: "Unique Visitors".to_string(), value: report.total_visitors.to_string(), change: Some(format!("{}% human · {}% bot", vis_human_pct, vis_bot_pct)) },
         Kpi { label: "Active Bots".to_string(), value: report.bot_stats.len().to_string(), change: None },
     ]);
 

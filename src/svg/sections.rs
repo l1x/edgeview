@@ -1,6 +1,16 @@
 use crate::svg::SvgDoc;
 use crate::model::*;
 
+fn human_bot_pct(hits: u64, bot_hits: u64) -> (u64, u64) {
+    if hits == 0 {
+        return (100, 0);
+    }
+    let bot_hits = bot_hits.min(hits);
+    let bot_pct = (bot_hits * 100) / hits;
+    let human_pct = 100 - bot_pct;
+    (human_pct, bot_pct)
+}
+
 impl SvgDoc {
     pub fn add_kpi_cards(&mut self, kpis: &[Kpi]) {
         let card_width = (self.width - self.theme.spacing * (kpis.len() as f64 + 1.0)) / kpis.len() as f64;
@@ -19,9 +29,17 @@ impl SvgDoc {
                 tx = x_offset + 15.0,
                 ty = self.y_cursor + 30.0,
                 label = kpi.label,
-                vy = self.y_cursor + 70.0,
+                vy = self.y_cursor + 60.0,
                 value = kpi.value
             ));
+            if let Some(change) = &kpi.change {
+                self.content.push_str(&format!(
+                    r#"<text x="{tx}" y="{cy}" class="text-muted">{change}</text>"#,
+                    tx = x_offset + 15.0,
+                    cy = self.y_cursor + 85.0,
+                    change = change,
+                ));
+            }
             x_offset += card_width + self.theme.spacing;
         }
         self.y_cursor += 120.0;
@@ -57,15 +75,18 @@ impl SvgDoc {
     pub fn add_top_content_pages(&mut self, pages: &[PageHits]) {
         self.add_section_title("Top Content");
         for page in pages {
+            let (human_pct, bot_pct) = human_bot_pct(page.hits, page.bot_hits);
             self.content.push_str(&format!(
                 r#"<text x="{x}" y="{y}" class="text">{path}</text>
-                   <text x="{rx}" y="{y}" class="text-mono" text-anchor="end">{hits} hits · {visitors} visitors</text>"#,
+                   <text x="{rx}" y="{y}" class="text-mono" text-anchor="end">{hits} hits · {visitors} visitors · {human_pct}% human · {bot_pct}% bot</text>"#,
                 x = self.theme.spacing,
                 y = self.y_cursor + 20.0,
                 path = page.path,
                 rx = self.width - self.theme.spacing,
                 hits = page.hits,
-                visitors = page.visitors
+                visitors = page.visitors,
+                human_pct = human_pct,
+                bot_pct = bot_pct,
             ));
             self.y_cursor += 30.0;
         }
@@ -75,15 +96,18 @@ impl SvgDoc {
     pub fn add_static_assets(&mut self, pages: &[PageHits]) {
         self.add_section_title("Static Assets");
         for page in pages {
+            let (human_pct, bot_pct) = human_bot_pct(page.hits, page.bot_hits);
             self.content.push_str(&format!(
                 r#"<text x="{x}" y="{y}" class="text">{path}</text>
-                   <text x="{rx}" y="{y}" class="text-mono" text-anchor="end">{hits} hits · {visitors} visitors</text>"#,
+                   <text x="{rx}" y="{y}" class="text-mono" text-anchor="end">{hits} hits · {visitors} visitors · {human_pct}% human · {bot_pct}% bot</text>"#,
                 x = self.theme.spacing,
                 y = self.y_cursor + 20.0,
                 path = page.path,
                 rx = self.width - self.theme.spacing,
                 hits = page.hits,
-                visitors = page.visitors
+                visitors = page.visitors,
+                human_pct = human_pct,
+                bot_pct = bot_pct,
             ));
             self.y_cursor += 30.0;
         }

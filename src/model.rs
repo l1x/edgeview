@@ -13,6 +13,7 @@ pub struct PageHits {
     pub path: String,
     pub hits: u64,
     pub visitors: u64,
+    pub bot_hits: u64,
     pub category: String,
 }
 
@@ -27,6 +28,8 @@ pub struct CrawlerStats {
 pub struct MonthReport {
     pub total_hits: u64,
     pub total_visitors: u64,
+    pub total_bot_hits: u64,
+    pub total_bot_visitors: u64,
     pub daily: Vec<DailyTraffic>,
     pub top_pages: Vec<PageHits>,
     pub bot_stats: Vec<CrawlerStats>,
