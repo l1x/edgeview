@@ -13,7 +13,16 @@ chrono = { version = "0.4", features = ["serde"] }
 # CLI & Config
 clap = { version = "4.4", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 toml = "0.8"
+
+# AWS
+aws-config = "1"
+aws-credential-types = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = "0.3"
 
 # Parsing & Utils
 regex = "1.10"

@@ -1,5 +1,4 @@
 pub mod layout;
-pub mod chart;
 pub mod theme;
 pub mod sections;
 
@@ -30,6 +29,7 @@ impl SvgDoc {
         .text {{ font-family: {font}; font-size: 14px; fill: {text_main}; }}
         .text-mono {{ font-family: {font_mono}; font-size: 12px; fill: {text_muted}; }}
         .title {{ font-family: {font}; font-size: 24px; font-weight: 600; fill: {text_main}; }}
+        .accent {{ font-family: {font}; font-size: 24px; font-weight: 600; fill: {accent}; }}
     </style>
     {content}
 </svg>"#,
@@ -40,6 +40,7 @@ impl SvgDoc {
             font_mono = self.theme.font_mono,
             text_main = self.theme.text_main,
             text_muted = self.theme.text_muted,
+            accent = self.theme.accent,
             content = self.content
         )
     }

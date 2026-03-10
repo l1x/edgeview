@@ -6,11 +6,14 @@ mod classify;
 mod sitemap;
 
 use std::path::PathBuf;
+use std::collections::HashMap;
 use clap::Parser;
-use crate::config::Config;
+use tracing::{info, error};
+use crate::config::{Config, SiteConfig};
 use crate::query::QueryEngine;
 use crate::svg::SvgDoc;
-use crate::svg::theme::SCANDINAVIAN;
+use crate::svg::theme::GREY_ORANGE;
+use crate::model::{Kpi, MonthReport};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -19,65 +22,131 @@ struct Args {
     config: Option<PathBuf>,
 
     #[arg(short, long)]
-    s3_path: Option<String>,
-
-    #[arg(short, long)]
     month: String,
 
-    #[arg(short, long)]
-    domain: Option<String>,
+    #[arg(long, default_value_t = false)]
+    no_cache: bool,
+}
 
-    #[arg(short, long)]
-    sitemap: Option<PathBuf>,
+async fn process_site(
+    site: &SiteConfig,
+    month: &str,
+    no_cache: bool,
+    bots: &HashMap<String, String>,
+    default_region: &str,
+    output_dir: &PathBuf,
+) -> anyhow::Result<()> {
+    let cache_dir = PathBuf::from(".edgeview_cache").join(&site.domain);
+    let cache_file = cache_dir.join(format!("{}.json", month));
 
-    #[arg(short, long)]
-    output: PathBuf,
+    let report = if !no_cache && cache_file.exists() {
+        info!(domain = %site.domain, "Loading data from local cache");
+        let content = std::fs::read_to_string(&cache_file)?;
+        serde_json::from_str::<MonthReport>(&content)?
+    } else {
+        info!(domain = %site.domain, month, "Initializing DataFusion engine");
+        let s3_month = month.replace("-", "/");
+        let engine = QueryEngine::new(site, default_region).await?;
+        engine.load_logs(&site.s3_path, &s3_month).await?;
+
+        info!(domain = %site.domain, "Analyzing traffic from S3");
+        let (total_hits, total_visitors) = engine.summary().await?;
+        let daily = engine.daily_traffic().await?;
+        let top_pages = engine.top_pages().await?;
+        let bot_stats = engine.bot_activity(bots).await?;
+        let google_hits = engine.googlebot_hits().await?;
+
+        let report = MonthReport {
+            total_hits,
+            total_visitors,
+            daily,
+            top_pages,
+            bot_stats,
+            google_hits,
+        };
+
+        std::fs::create_dir_all(&cache_dir)?;
+        let json = serde_json::to_string_pretty(&report)?;
+        std::fs::write(&cache_file, json)?;
+        info!(domain = %site.domain, "Cached report to {}", cache_file.display());
+
+        report
+    };
+
+    // Optional Sitemap Analysis
+    let mut missing_urls: Vec<String> = Vec::new();
+    if let Some(sitemap_path) = &site.sitemap {
+        info!(domain = %site.domain, "Parsing sitemap and analyzing indexing gaps");
+        let sitemap_urls = crate::sitemap::parse_sitemap(sitemap_path)?;
+
+        for url in sitemap_urls {
+            let path = url::Url::parse(&url).map(|u| u.path().to_string()).unwrap_or(url.clone());
+            if !report.google_hits.contains_key(&path) {
+                missing_urls.push(url.clone());
+            }
+        }
+    }
+
+    // Generate SVG
+    let output_file = output_dir.join(format!("{}-{}.svg", site.domain, month));
+    info!(domain = %site.domain, path = %output_file.display(), "Generating SVG report");
+
+    // Split pages by category
+    let content_pages: Vec<_> = report.top_pages.iter()
+        .filter(|p| p.category == "article" || p.category == "page")
+        .take(15)
+        .cloned()
+        .collect();
+    let static_assets: Vec<_> = report.top_pages.iter()
+        .filter(|p| p.category == "static")
+        .cloned()
+        .collect();
+
+    let mut doc = SvgDoc::new(800.0, GREY_ORANGE);
+    doc.add_section_title(&format!("Traffic Report: {} ({})", site.domain, month));
+
+    doc.add_kpi_cards(&[
+        Kpi { label: "Total Hits".to_string(), value: report.total_hits.to_string(), change: None },
+        Kpi { label: "Unique Visitors".to_string(), value: report.total_visitors.to_string(), change: None },
+        Kpi { label: "Active Bots".to_string(), value: report.bot_stats.len().to_string(), change: None },
+    ]);
+
+    doc.add_daily_traffic_section(&report.daily);
+    doc.add_top_content_pages(&content_pages);
+    doc.add_static_assets(&static_assets);
+    doc.add_bot_activity_section(&report.bot_stats);
+
+    if site.sitemap.is_some() {
+        doc.add_crawl_gap_section(&missing_urls);
+    }
+
+    let svg_content = doc.finalize();
+    std::fs::create_dir_all(output_dir)?;
+    std::fs::write(&output_file, svg_content)?;
+
+    Ok(())
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    tracing_subscriber::fmt::init();
+
     let args = Args::parse();
 
-    // Load configuration
-    let config = if let Some(path) = args.config {
-        Config::load(&path)?
-    } else {
-        // Fallback to defaults or partial config from args
-        Config {
-            domain: args.domain.unwrap_or_default(),
-            s3_path: args.s3_path.unwrap_or_default(),
-            s3_region: "eu-west-1".to_string(),
-            sitemap: args.sitemap,
-            output_dir: args.output.parent().unwrap_or_else(|| std::path::Path::new(".")).to_path_buf(),
-            url_rewrites: None,
-            categories: None,
-            bots: std::collections::HashMap::new(),
+    let config_path = args.config.unwrap_or_else(|| PathBuf::from("edgeview.toml"));
+    if !config_path.exists() {
+        anyhow::bail!("Configuration file not found: {}. Please create one or specify with --config.", config_path.display());
+    }
+
+    let config = Config::load(&config_path)?;
+
+    for site in &config.sites {
+        if let Err(e) = process_site(&site, &args.month, args.no_cache, &config.bots, &config.default_s3_region, &config.output_dir).await {
+            error!(domain = %site.domain, error = %e, "Failed to process site");
+            return Err(e.context(format!("Failed to process site {}", site.domain)));
         }
-    };
+    }
 
-    println!("Initializing DataFusion engine for month {}...", args.month);
-    let engine = QueryEngine::new(&config).await?;
-    engine.load_logs(&config.s3_path, &args.month).await?;
-
-    // Perform queries
-    println!("Analyzing traffic...");
-    // let daily = engine.daily_traffic().await?;
-    
-    // Generate SVG
-    println!("Generating SVG report to {}...", args.output.display());
-    let mut doc = SvgDoc::new(800.0, SCANDINAVIAN);
-    doc.add_section_title(&format!("Traffic Report: {} ({})", config.domain, args.month));
-    
-    // Placeholder sections
-    doc.add_bar_chart("Daily Hits (Top 5)", &[
-        ("2026-03-01".to_string(), 120u64),
-        ("2026-03-02".to_string(), 150u64),
-        ("2026-03-03".to_string(), 90u64),
-    ]);
-
-    let svg_content = doc.finalize();
-    std::fs::write(&args.output, svg_content)?;
-
-    println!("Report generated successfully.");
+    info!("Finished processing all sites");
     Ok(())
 }

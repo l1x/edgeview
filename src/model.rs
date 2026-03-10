@@ -8,18 +8,12 @@ pub struct DailyTraffic {
     pub visitors: u64,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PageHits {
     pub path: String,
     pub hits: u64,
     pub visitors: u64,
     pub category: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Referrer {
-    pub domain: String,
-    pub hits: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -30,16 +24,13 @@ pub struct CrawlerStats {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct CrawlRecord {
-    pub path: String,
-    pub hits: u64,
-    pub last_date: NaiveDate,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct EdgeStats {
-    pub location: String,
-    pub hits: u64,
+pub struct MonthReport {
+    pub total_hits: u64,
+    pub total_visitors: u64,
+    pub daily: Vec<DailyTraffic>,
+    pub top_pages: Vec<PageHits>,
+    pub bot_stats: Vec<CrawlerStats>,
+    pub google_hits: std::collections::HashMap<String, u64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
