@@ -3,6 +3,7 @@ mod model;
 mod query;
 mod svg;
 mod classify;
+mod html;
 mod sitemap;
 
 use std::path::PathBuf;
@@ -57,6 +58,9 @@ async fn process_site(
         let top_pages = engine.top_pages(&bot_path_hits).await?;
         let bot_stats = engine.bot_activity(bots).await?;
         let google_hits = engine.googlebot_hits().await?;
+        let daily_bot_path_hits = engine.daily_bot_hits_by_path(bots).await?;
+        let daily_pages = engine.daily_top_pages(&daily_bot_path_hits).await?;
+        let daily_hourly = engine.daily_hourly_traffic().await?;
 
         let report = MonthReport {
             total_hits,
@@ -67,6 +71,8 @@ async fn process_site(
             top_pages,
             bot_stats,
             google_hits,
+            daily_pages,
+            daily_hourly,
         };
 
         std::fs::create_dir_all(&cache_dir)?;
@@ -107,7 +113,7 @@ async fn process_site(
         .collect();
 
     let mut doc = SvgDoc::new(800.0, GREY_ORANGE);
-    doc.add_section_title(&format!("Traffic Report: {} ({})", site.domain, month));
+    doc.add_section_title(&format!("{} / {}", site.domain, month));
 
     let hits_bot_pct = if report.total_hits > 0 { (report.total_bot_hits * 100) / report.total_hits } else { 0 };
     let hits_human_pct = 100 - hits_bot_pct;
@@ -131,7 +137,20 @@ async fn process_site(
 
     let svg_content = doc.finalize();
     std::fs::create_dir_all(output_dir)?;
-    std::fs::write(&output_file, svg_content)?;
+    std::fs::write(&output_file, &svg_content)?;
+
+    // Generate HTML report with month + daily tabs
+    let html_file = output_dir.join(format!("{}-{}.html", site.domain, month));
+    info!(domain = %site.domain, path = %html_file.display(), "Generating HTML report");
+    let html_content = crate::html::generate_report(
+        &site.domain,
+        month,
+        &svg_content,
+        &report.daily_pages,
+        &report.daily_hourly,
+        &report.bot_stats,
+    );
+    std::fs::write(&html_file, html_content)?;
 
     Ok(())
 }

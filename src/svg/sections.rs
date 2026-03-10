@@ -68,8 +68,19 @@ impl SvgDoc {
                 h = h,
                 fill = self.theme.bar_pastel
             ));
+
+            // Date label below bar
+            let label = t.date.format("%-d").to_string();
+            let label_x = x + bar_width / 2.0;
+            let label_y = self.y_cursor + chart_height + 16.0;
+            self.content.push_str(&format!(
+                r#"<text x="{x}" y="{y}" class="text-mono" text-anchor="middle">{label}</text>"#,
+                x = label_x,
+                y = label_y,
+                label = label,
+            ));
         }
-        self.y_cursor += chart_height + 40.0;
+        self.y_cursor += chart_height + 30.0;
     }
 
     pub fn add_top_content_pages(&mut self, pages: &[PageHits]) {
@@ -125,6 +136,56 @@ impl SvgDoc {
                 name = bot.bot_name,
                 rx = self.width - self.theme.spacing,
                 hits = bot.hits
+            ));
+            self.y_cursor += 30.0;
+        }
+        self.y_cursor += self.theme.spacing;
+    }
+
+    pub fn add_hourly_traffic_section(&mut self, traffic: &[HourlyTraffic]) {
+        self.add_section_title("Hourly Traffic (UTC)");
+        if traffic.is_empty() { return; }
+
+        let max_hits = traffic.iter().map(|t| t.hits).max().unwrap_or(1) as f64;
+        let chart_height = 160.0;
+        let chart_width = self.width - self.theme.spacing * 2.0;
+        let slot = chart_width / 24.0;
+        let bar_width = slot * 0.8;
+
+        for t in traffic {
+            let h = (t.hits as f64 / max_hits) * chart_height;
+            let x = self.theme.spacing + t.hour as f64 * slot;
+            let y = self.y_cursor + chart_height - h;
+
+            self.content.push_str(&format!(
+                r#"<rect x="{x}" y="{y}" width="{w}" height="{h}" fill="{fill}" rx="2" />"#,
+                x = x, y = y, w = bar_width, h = h, fill = self.theme.bar_pastel
+            ));
+
+            let label_x = x + bar_width / 2.0;
+            let label_y = self.y_cursor + chart_height + 16.0;
+            self.content.push_str(&format!(
+                r#"<text x="{x}" y="{y}" class="text-mono" text-anchor="middle">{label}</text>"#,
+                x = label_x, y = label_y, label = t.hour,
+            ));
+        }
+        self.y_cursor += chart_height + 30.0;
+    }
+
+    pub fn add_daily_page_table(&mut self, pages: &[PageHits]) {
+        for page in pages.iter().take(20) {
+            let (human_pct, bot_pct) = human_bot_pct(page.hits, page.bot_hits);
+            self.content.push_str(&format!(
+                r#"<text x="{x}" y="{y}" class="text">{path}</text>
+                   <text x="{rx}" y="{y}" class="text-mono" text-anchor="end">{hits} hits · {visitors} visitors · {human_pct}% human · {bot_pct}% bot</text>"#,
+                x = self.theme.spacing,
+                y = self.y_cursor + 20.0,
+                path = page.path,
+                rx = self.width - self.theme.spacing,
+                hits = page.hits,
+                visitors = page.visitors,
+                human_pct = human_pct,
+                bot_pct = bot_pct,
             ));
             self.y_cursor += 30.0;
         }

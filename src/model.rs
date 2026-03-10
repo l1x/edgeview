@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 
@@ -17,6 +18,13 @@ pub struct PageHits {
     pub category: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HourlyTraffic {
+    pub hour: u8,
+    pub hits: u64,
+    pub visitors: u64,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CrawlerStats {
     pub bot_name: String,
@@ -33,7 +41,11 @@ pub struct MonthReport {
     pub daily: Vec<DailyTraffic>,
     pub top_pages: Vec<PageHits>,
     pub bot_stats: Vec<CrawlerStats>,
-    pub google_hits: std::collections::HashMap<String, u64>,
+    pub google_hits: HashMap<String, u64>,
+    #[serde(default)]
+    pub daily_pages: HashMap<String, Vec<PageHits>>,
+    #[serde(default)]
+    pub daily_hourly: HashMap<String, Vec<HourlyTraffic>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

@@ -329,6 +329,168 @@ impl QueryEngine {
         Ok(results)
     }
 
+    pub async fn daily_bot_hits_by_path(&self, bot_map: &HashMap<String, String>) -> anyhow::Result<HashMap<String, HashMap<String, u64>>> {
+        if bot_map.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let like_clauses: Vec<String> = bot_map.keys()
+            .map(|pattern| format!("\"cs_User_Agent\" LIKE '%{}%'", pattern.replace('\'', "''")))
+            .collect();
+        let where_bots = like_clauses.join(" OR ");
+
+        let sql = format!(
+            "SELECT date, cs_uri_stem, COUNT(*) as bot_hits \
+             FROM logs \
+             WHERE cs_method = 'GET' \
+               AND sc_status IN ('200', '304') \
+               AND ({}) \
+             GROUP BY date, cs_uri_stem",
+            where_bots
+        );
+
+        let df = self.ctx.sql(&sql).await?;
+        let batches = df.collect().await?;
+        let mut results: HashMap<String, HashMap<String, u64>> = HashMap::new();
+
+        for batch in batches {
+            let date_col = batch.column(0).as_any().downcast_ref::<StringArray>()
+                .ok_or_else(|| anyhow::anyhow!("Failed to downcast date column"))?;
+            let path_col = batch.column(1).as_any().downcast_ref::<StringArray>()
+                .ok_or_else(|| anyhow::anyhow!("Failed to downcast path column"))?;
+            let hits_col = batch.column(2).as_any().downcast_ref::<Int64Array>()
+                .ok_or_else(|| anyhow::anyhow!("Failed to downcast hits column"))?;
+
+            for i in 0..batch.num_rows() {
+                results
+                    .entry(date_col.value(i).to_string())
+                    .or_default()
+                    .insert(path_col.value(i).to_string(), hits_col.value(i) as u64);
+            }
+        }
+
+        info!(dates = results.len(), "Computed daily bot hits by path");
+        Ok(results)
+    }
+
+    pub async fn daily_top_pages(&self, daily_bot_hits: &HashMap<String, HashMap<String, u64>>) -> anyhow::Result<HashMap<String, Vec<PageHits>>> {
+        let df = self.ctx.sql("
+            SELECT
+                date,
+                cs_uri_stem as path,
+                COUNT(*) as hits,
+                COUNT(DISTINCT c_ip) as visitors
+            FROM logs
+            WHERE cs_method = 'GET'
+              AND sc_status IN ('200', '304')
+            GROUP BY date, cs_uri_stem
+            ORDER BY date, hits DESC
+        ").await?;
+
+        let batches = df.collect().await?;
+        // date_str -> (category, display_path) -> (hits, visitors, bot_hits)
+        let mut by_date: HashMap<String, HashMap<(String, String), (u64, u64, u64)>> = HashMap::new();
+
+        for batch in batches {
+            let date_col = batch.column(0).as_any().downcast_ref::<StringArray>()
+                .ok_or_else(|| anyhow::anyhow!("Failed to downcast date column"))?;
+            let path_col = batch.column(1).as_any().downcast_ref::<StringArray>()
+                .ok_or_else(|| anyhow::anyhow!("Failed to downcast path column"))?;
+            let hits_col = batch.column(2).as_any().downcast_ref::<Int64Array>()
+                .ok_or_else(|| anyhow::anyhow!("Failed to downcast hits column"))?;
+            let visitors_col = batch.column(3).as_any().downcast_ref::<Int64Array>()
+                .ok_or_else(|| anyhow::anyhow!("Failed to downcast visitors column"))?;
+
+            for i in 0..batch.num_rows() {
+                let date_str = date_col.value(i).to_string();
+                let path = path_col.value(i);
+                let hits = hits_col.value(i) as u64;
+                let visitors = visitors_col.value(i) as u64;
+
+                let (category, display_path) = classify_path(path);
+                let bot_hits = daily_bot_hits
+                    .get(&date_str)
+                    .and_then(|m| m.get(path))
+                    .copied()
+                    .unwrap_or(0);
+
+                let rollup = by_date.entry(date_str).or_default();
+                let entry = rollup.entry((category.to_string(), display_path)).or_insert((0, 0, 0));
+                entry.0 += hits;
+                entry.1 += visitors;
+                entry.2 += bot_hits;
+            }
+        }
+
+        let mut results: HashMap<String, Vec<PageHits>> = HashMap::new();
+        for (date_str, rollup) in by_date {
+            let mut pages: Vec<PageHits> = rollup
+                .into_iter()
+                .map(|((category, path), (hits, visitors, bot_hits))| PageHits {
+                    path,
+                    hits,
+                    visitors,
+                    bot_hits,
+                    category,
+                })
+                .collect();
+            pages.sort_by_key(|p| std::cmp::Reverse(p.hits));
+            results.insert(date_str, pages);
+        }
+
+        info!(dates = results.len(), "Computed daily top pages");
+        Ok(results)
+    }
+
+    pub async fn daily_hourly_traffic(&self) -> anyhow::Result<HashMap<String, Vec<HourlyTraffic>>> {
+        let df = self.ctx.sql("
+            SELECT
+                date,
+                LEFT(time, 2) as hour,
+                COUNT(*) as hits,
+                COUNT(DISTINCT c_ip) as visitors
+            FROM logs
+            WHERE cs_method = 'GET'
+              AND sc_status IN ('200', '304')
+            GROUP BY date, hour
+            ORDER BY date, hour
+        ").await?;
+
+        let batches = df.collect().await?;
+        let mut results: HashMap<String, Vec<HourlyTraffic>> = HashMap::new();
+
+        for batch in batches {
+            let date_col = batch.column(0).as_any().downcast_ref::<StringArray>()
+                .ok_or_else(|| anyhow::anyhow!("Failed to downcast date column"))?;
+            let hour_col = batch.column(1).as_any().downcast_ref::<StringArray>()
+                .ok_or_else(|| anyhow::anyhow!("Failed to downcast hour column"))?;
+            let hits_col = batch.column(2).as_any().downcast_ref::<Int64Array>()
+                .ok_or_else(|| anyhow::anyhow!("Failed to downcast hits column"))?;
+            let visitors_col = batch.column(3).as_any().downcast_ref::<Int64Array>()
+                .ok_or_else(|| anyhow::anyhow!("Failed to downcast visitors column"))?;
+
+            for i in 0..batch.num_rows() {
+                let hour: u8 = hour_col.value(i).parse().unwrap_or(0);
+                results
+                    .entry(date_col.value(i).to_string())
+                    .or_default()
+                    .push(HourlyTraffic {
+                        hour,
+                        hits: hits_col.value(i) as u64,
+                        visitors: visitors_col.value(i) as u64,
+                    });
+            }
+        }
+
+        // Ensure each day has all 24 hours sorted
+        for hours in results.values_mut() {
+            hours.sort_by_key(|h| h.hour);
+        }
+
+        info!(dates = results.len(), "Computed daily hourly traffic");
+        Ok(results)
+    }
+
     pub async fn googlebot_hits(&self) -> anyhow::Result<HashMap<String, u64>> {
         let df = self.ctx.sql("
             SELECT
