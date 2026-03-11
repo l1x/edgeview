@@ -192,6 +192,39 @@ impl SvgDoc {
         self.y_cursor += self.theme.spacing;
     }
 
+    pub fn add_monthly_traffic_section(&mut self, traffic: &[MonthlyTraffic]) {
+        self.add_section_title("Monthly Traffic");
+        if traffic.is_empty() { return; }
+
+        let month_labels = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+        let max_hits = traffic.iter().map(|t| t.hits).max().unwrap_or(1) as f64;
+        let chart_height = 200.0;
+        let chart_width = self.width - self.theme.spacing * 2.0;
+        let bar_width = (chart_width / 12.0) * 0.8;
+        let gap = (chart_width / 12.0) * 0.2;
+
+        for (i, t) in traffic.iter().enumerate() {
+            let h = (t.hits as f64 / max_hits) * chart_height;
+            let x = self.theme.spacing + i as f64 * (bar_width + gap);
+            let y = self.y_cursor + chart_height - h;
+
+            self.content.push_str(&format!(
+                r#"<rect x="{x}" y="{y}" width="{w}" height="{h}" fill="{fill}" rx="2" />"#,
+                x = x, y = y, w = bar_width, h = h, fill = self.theme.bar_pastel
+            ));
+
+            // Month label
+            let label_idx = i.min(11);
+            let label_x = x + bar_width / 2.0;
+            let label_y = self.y_cursor + chart_height + 16.0;
+            self.content.push_str(&format!(
+                r#"<text x="{x}" y="{y}" class="text-mono" text-anchor="middle">{label}</text>"#,
+                x = label_x, y = label_y, label = month_labels[label_idx],
+            ));
+        }
+        self.y_cursor += chart_height + 30.0;
+    }
+
     pub fn add_crawl_gap_section(&mut self, missing_urls: &[String]) {
         self.add_section_title("Indexing Gaps (Sitemap vs Googlebot)");
         if missing_urls.is_empty() {
