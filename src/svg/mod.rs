@@ -1,6 +1,6 @@
 pub mod layout;
-pub mod theme;
 pub mod sections;
+pub mod theme;
 
 use crate::svg::theme::Theme;
 

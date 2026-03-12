@@ -1,22 +1,22 @@
+mod classify;
 mod config;
+mod html;
 mod model;
 mod query;
-mod svg;
-mod classify;
-mod html;
 mod sitemap;
+mod svg;
 
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::collections::HashMap;
+use crate::config::{Config, SiteConfig};
+use crate::model::{DayCache, Kpi, MonthReport, YearReport};
+use crate::query::QueryEngine;
+use crate::svg::theme::GREY_ORANGE;
+use crate::svg::SvgDoc;
 use chrono::{Datelike, NaiveDate, Utc};
 use clap::Parser;
-use tracing::{info, warn, error};
-use crate::config::{Config, SiteConfig};
-use crate::query::QueryEngine;
-use crate::svg::SvgDoc;
-use crate::svg::theme::GREY_ORANGE;
-use crate::model::{DayCache, Kpi, MonthReport, YearReport};
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+use tracing::{error, info, warn};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -36,7 +36,11 @@ struct Args {
 
 /// Determine which dates in the given month need querying.
 /// Past days with existing cache files are skipped. Today is always re-queried.
-fn dates_to_query(month: &str, cache_dir: &PathBuf, no_cache: bool) -> anyhow::Result<(Vec<NaiveDate>, Vec<NaiveDate>)> {
+fn dates_to_query(
+    month: &str,
+    cache_dir: &PathBuf,
+    no_cache: bool,
+) -> anyhow::Result<(Vec<NaiveDate>, Vec<NaiveDate>)> {
     let parts: Vec<&str> = month.split('-').collect();
     if parts.len() != 2 {
         anyhow::bail!("Invalid month format '{}', expected YYYY-MM", month);
@@ -47,12 +51,22 @@ fn dates_to_query(month: &str, cache_dir: &PathBuf, no_cache: bool) -> anyhow::R
     let first_day = NaiveDate::from_ymd_opt(year, month_num, 1)
         .ok_or_else(|| anyhow::anyhow!("Invalid month: {}", month))?;
     let last_day_of_month = if month_num == 12 {
-        NaiveDate::from_ymd_opt(year + 1, 1, 1).unwrap().pred_opt().unwrap()
+        NaiveDate::from_ymd_opt(year + 1, 1, 1)
+            .unwrap()
+            .pred_opt()
+            .unwrap()
     } else {
-        NaiveDate::from_ymd_opt(year, month_num + 1, 1).unwrap().pred_opt().unwrap()
+        NaiveDate::from_ymd_opt(year, month_num + 1, 1)
+            .unwrap()
+            .pred_opt()
+            .unwrap()
     };
     let today = Utc::now().date_naive();
-    let end_date = if last_day_of_month < today { last_day_of_month } else { today };
+    let end_date = if last_day_of_month < today {
+        last_day_of_month
+    } else {
+        today
+    };
 
     let mut to_query = Vec::new();
     let mut cached = Vec::new();
@@ -72,7 +86,11 @@ fn dates_to_query(month: &str, cache_dir: &PathBuf, no_cache: bool) -> anyhow::R
 }
 
 /// Write visitor IPs to a Parquet file: columns (date Utf8, c_ip Utf8, is_bot Boolean).
-fn write_visitor_parquet(path: &std::path::Path, date: &NaiveDate, visitors: &[(String, bool)]) -> anyhow::Result<()> {
+fn write_visitor_parquet(
+    path: &std::path::Path,
+    date: &NaiveDate,
+    visitors: &[(String, bool)],
+) -> anyhow::Result<()> {
     use datafusion::arrow::array::{BooleanArray, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
@@ -117,12 +135,18 @@ fn write_visitor_parquet(path: &std::path::Path, date: &NaiveDate, visitors: &[(
 
 /// Count unique visitors from visitor Parquet files in the given date range.
 /// Returns (total_unique_visitors, bot_unique_visitors).
-async fn count_unique_visitors(visitor_dir: &std::path::Path, date_from: NaiveDate, date_to: NaiveDate) -> anyhow::Result<(u64, u64)> {
-    use datafusion::prelude::*;
-    use datafusion::datasource::file_format::parquet::ParquetFormat;
-    use datafusion::datasource::listing::{ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl};
-    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+async fn count_unique_visitors(
+    visitor_dir: &std::path::Path,
+    date_from: NaiveDate,
+    date_to: NaiveDate,
+) -> anyhow::Result<(u64, u64)> {
     use datafusion::arrow::array::Int64Array;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::datasource::file_format::parquet::ParquetFormat;
+    use datafusion::datasource::listing::{
+        ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
+    };
+    use datafusion::prelude::*;
 
     if !visitor_dir.exists() {
         return Ok((0, 0));
@@ -139,8 +163,8 @@ async fn count_unique_visitors(visitor_dir: &std::path::Path, date_from: NaiveDa
         Field::new("is_bot", DataType::Boolean, false),
     ]));
 
-    let listing_options = ListingOptions::new(Arc::new(ParquetFormat::default()))
-        .with_file_extension(".parquet");
+    let listing_options =
+        ListingOptions::new(Arc::new(ParquetFormat::default())).with_file_extension(".parquet");
 
     let config = ListingTableConfig::new(table_url)
         .with_listing_options(listing_options)
@@ -159,11 +183,18 @@ async fn count_unique_visitors(visitor_dir: &std::path::Path, date_from: NaiveDa
     let batches = df.collect().await?;
     let total = if let Some(batch) = batches.first() {
         if batch.num_rows() > 0 {
-            batch.column(0).as_any().downcast_ref::<Int64Array>()
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
                 .map(|a| a.value(0) as u64)
                 .unwrap_or(0)
-        } else { 0 }
-    } else { 0 };
+        } else {
+            0
+        }
+    } else {
+        0
+    };
 
     let sql_bot = format!(
         "SELECT COUNT(DISTINCT c_ip) as bot_visitors \
@@ -175,23 +206,39 @@ async fn count_unique_visitors(visitor_dir: &std::path::Path, date_from: NaiveDa
     let batches = df.collect().await?;
     let bot = if let Some(batch) = batches.first() {
         if batch.num_rows() > 0 {
-            batch.column(0).as_any().downcast_ref::<Int64Array>()
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
                 .map(|a| a.value(0) as u64)
                 .unwrap_or(0)
-        } else { 0 }
-    } else { 0 };
+        } else {
+            0
+        }
+    } else {
+        0
+    };
 
     Ok((total, bot))
 }
 
 /// Build the month SVG content (shared between --month and --year modes).
-fn build_month_svg(site: &SiteConfig, month: &str, report: &MonthReport, missing_urls: &[String]) -> String {
-    let content_pages: Vec<_> = report.top_pages.iter()
+fn build_month_svg(
+    site: &SiteConfig,
+    month: &str,
+    report: &MonthReport,
+    missing_urls: &[String],
+) -> String {
+    let content_pages: Vec<_> = report
+        .top_pages
+        .iter()
         .filter(|p| p.category == "article" || p.category == "page")
         .take(15)
         .cloned()
         .collect();
-    let static_assets: Vec<_> = report.top_pages.iter()
+    let static_assets: Vec<_> = report
+        .top_pages
+        .iter()
         .filter(|p| p.category == "static")
         .cloned()
         .collect();
@@ -199,15 +246,35 @@ fn build_month_svg(site: &SiteConfig, month: &str, report: &MonthReport, missing
     let mut doc = SvgDoc::new(800.0, GREY_ORANGE);
     doc.add_section_title(&format!("{} / {}", site.domain, month));
 
-    let hits_bot_pct = if report.total_hits > 0 { (report.total_bot_hits * 100) / report.total_hits } else { 0 };
+    let hits_bot_pct = if report.total_hits > 0 {
+        (report.total_bot_hits * 100) / report.total_hits
+    } else {
+        0
+    };
     let hits_human_pct = 100 - hits_bot_pct;
-    let vis_bot_pct = if report.total_visitors > 0 { (report.total_bot_visitors * 100) / report.total_visitors } else { 0 };
+    let vis_bot_pct = if report.total_visitors > 0 {
+        (report.total_bot_visitors * 100) / report.total_visitors
+    } else {
+        0
+    };
     let vis_human_pct = 100 - vis_bot_pct;
 
     doc.add_kpi_cards(&[
-        Kpi { label: "Total Hits".to_string(), value: report.total_hits.to_string(), change: Some(format!("{}% human · {}% bot", hits_human_pct, hits_bot_pct)) },
-        Kpi { label: "Unique Visitors".to_string(), value: report.total_visitors.to_string(), change: Some(format!("{}% human · {}% bot", vis_human_pct, vis_bot_pct)) },
-        Kpi { label: "Active Bots".to_string(), value: report.bot_stats.len().to_string(), change: None },
+        Kpi {
+            label: "Total Hits".to_string(),
+            value: report.total_hits.to_string(),
+            change: Some(format!("{}% human · {}% bot", hits_human_pct, hits_bot_pct)),
+        },
+        Kpi {
+            label: "Unique Visitors".to_string(),
+            value: report.total_visitors.to_string(),
+            change: Some(format!("{}% human · {}% bot", vis_human_pct, vis_bot_pct)),
+        },
+        Kpi {
+            label: "Active Bots".to_string(),
+            value: report.bot_stats.len().to_string(),
+            change: None,
+        },
     ]);
 
     doc.add_daily_traffic_section(&report.daily);
@@ -308,7 +375,8 @@ async fn process_site(
         }
     }
 
-    let all_days = sync_and_query_month(site, month, bots, default_region, &cache_dir, no_cache).await?;
+    let all_days =
+        sync_and_query_month(site, month, bots, default_region, &cache_dir, no_cache).await?;
 
     // Compute exact visitor counts from Parquet
     let visitor_dir = cache_dir.join("visitors");
@@ -317,9 +385,15 @@ async fn process_site(
     let month_num: u32 = parts[1].parse()?;
     let first_day = NaiveDate::from_ymd_opt(year, month_num, 1).unwrap();
     let last_day = if month_num == 12 {
-        NaiveDate::from_ymd_opt(year + 1, 1, 1).unwrap().pred_opt().unwrap()
+        NaiveDate::from_ymd_opt(year + 1, 1, 1)
+            .unwrap()
+            .pred_opt()
+            .unwrap()
     } else {
-        NaiveDate::from_ymd_opt(year, month_num + 1, 1).unwrap().pred_opt().unwrap()
+        NaiveDate::from_ymd_opt(year, month_num + 1, 1)
+            .unwrap()
+            .pred_opt()
+            .unwrap()
     };
     let today = Utc::now().date_naive();
     let end_date = if last_day < today { last_day } else { today };
@@ -340,7 +414,9 @@ async fn process_site(
         info!(domain = %site.domain, "Parsing sitemap and analyzing indexing gaps");
         let sitemap_urls = crate::sitemap::parse_sitemap(sitemap_path)?;
         for url in sitemap_urls {
-            let path = url::Url::parse(&url).map(|u| u.path().to_string()).unwrap_or(url.clone());
+            let path = url::Url::parse(&url)
+                .map(|u| u.path().to_string())
+                .unwrap_or(url.clone());
             if !report.google_hits.contains_key(&path) {
                 missing_urls.push(url.clone());
             }
@@ -383,7 +459,11 @@ async fn process_site_year(
 
     let year_num: i32 = year.parse()?;
     let today = Utc::now().date_naive();
-    let max_month = if year_num == today.year() { today.month() } else { 12 };
+    let max_month = if year_num == today.year() {
+        today.month()
+    } else {
+        12
+    };
 
     let mut all_months: Vec<String> = Vec::new();
     for m in 1..=max_month {
@@ -392,11 +472,13 @@ async fn process_site_year(
 
     // Build MonthReport + SVG + HTML for each month
     let mut month_data: Vec<(String, MonthReport)> = Vec::new();
-    let mut month_svgs: Vec<(String, String)> = Vec::new();
+    let mut month_html_data: Vec<crate::html::MonthHtmlData> = Vec::new();
     let visitor_dir = cache_dir.join("visitors");
 
     for month_str in &all_months {
-        let all_days = sync_and_query_month(site, month_str, bots, default_region, &cache_dir, no_cache).await?;
+        let all_days =
+            sync_and_query_month(site, month_str, bots, default_region, &cache_dir, no_cache)
+                .await?;
 
         if all_days.is_empty() {
             continue;
@@ -408,9 +490,15 @@ async fn process_site_year(
         let mn: u32 = parts[1].parse()?;
         let first_day = NaiveDate::from_ymd_opt(y, mn, 1).unwrap();
         let last_day = if mn == 12 {
-            NaiveDate::from_ymd_opt(y + 1, 1, 1).unwrap().pred_opt().unwrap()
+            NaiveDate::from_ymd_opt(y + 1, 1, 1)
+                .unwrap()
+                .pred_opt()
+                .unwrap()
         } else {
-            NaiveDate::from_ymd_opt(y, mn + 1, 1).unwrap().pred_opt().unwrap()
+            NaiveDate::from_ymd_opt(y, mn + 1, 1)
+                .unwrap()
+                .pred_opt()
+                .unwrap()
         };
         let end_date = if last_day < today { last_day } else { today };
 
@@ -428,7 +516,9 @@ async fn process_site_year(
         if let Some(sitemap_path) = &site.sitemap {
             let sitemap_urls = crate::sitemap::parse_sitemap(sitemap_path)?;
             for url in sitemap_urls {
-                let path = url::Url::parse(&url).map(|u| u.path().to_string()).unwrap_or(url.clone());
+                let path = url::Url::parse(&url)
+                    .map(|u| u.path().to_string())
+                    .unwrap_or(url.clone());
                 if !report.google_hits.contains_key(&path) {
                     missing_urls.push(url.clone());
                 }
@@ -454,10 +544,35 @@ async fn process_site_year(
         );
         std::fs::write(&html_file, html_content)?;
 
-        // Build month summary SVG for year tabs
+        // Build raw data for year HTML dashboard
         let summary = crate::model::MonthSummary::from_month_report(&report, month_str);
-        let summary_svg = crate::html::build_month_summary_svg(&site.domain, month_str, &summary);
-        month_svgs.push((month_str.clone(), summary_svg));
+
+        let mut day_data: Vec<crate::html::DayHtmlData> = Vec::new();
+        let mut dates: Vec<&String> = report.daily_pages.keys().collect();
+        dates.sort();
+        for date_str in dates {
+            let pages = report.daily_pages[date_str].clone();
+            let hourly = report
+                .daily_hourly
+                .get(date_str.as_str())
+                .cloned()
+                .unwrap_or_default();
+            day_data.push(crate::html::DayHtmlData {
+                date: date_str.clone(),
+                hits: pages.iter().map(|p| p.hits).sum(),
+                visitors: pages.iter().map(|p| p.visitors).sum(),
+                bot_hits: pages.iter().map(|p| p.bot_hits).sum(),
+                pages,
+                hourly,
+                bot_stats: report.bot_stats.clone(),
+            });
+        }
+
+        month_html_data.push(crate::html::MonthHtmlData {
+            month: month_str.clone(),
+            summary,
+            days: day_data,
+        });
 
         month_data.push((month_str.clone(), report));
     }
@@ -481,31 +596,56 @@ async fn process_site_year(
     };
     info!(domain = %site.domain, year, visitors = year_visitors, bot_visitors = year_bot_visitors, "Year-level visitor counts");
 
-    let year_report = YearReport::from_month_data(year, month_data, (year_visitors, year_bot_visitors));
+    let year_report =
+        YearReport::from_month_data(year, month_data, (year_visitors, year_bot_visitors));
 
     // Generate year SVG
     let mut doc = SvgDoc::new(800.0, GREY_ORANGE);
     doc.add_section_title(&format!("{} / {}", site.domain, year));
 
-    let hits_bot_pct = if year_report.total_hits > 0 { (year_report.total_bot_hits * 100) / year_report.total_hits } else { 0 };
+    let hits_bot_pct = if year_report.total_hits > 0 {
+        (year_report.total_bot_hits * 100) / year_report.total_hits
+    } else {
+        0
+    };
     let hits_human_pct = 100 - hits_bot_pct;
-    let vis_bot_pct = if year_report.total_visitors > 0 { (year_report.total_bot_visitors * 100) / year_report.total_visitors } else { 0 };
+    let vis_bot_pct = if year_report.total_visitors > 0 {
+        (year_report.total_bot_visitors * 100) / year_report.total_visitors
+    } else {
+        0
+    };
     let vis_human_pct = 100 - vis_bot_pct;
 
     doc.add_kpi_cards(&[
-        Kpi { label: "Total Hits".to_string(), value: year_report.total_hits.to_string(), change: Some(format!("{}% human · {}% bot", hits_human_pct, hits_bot_pct)) },
-        Kpi { label: "Unique Visitors".to_string(), value: year_report.total_visitors.to_string(), change: Some(format!("{}% human · {}% bot", vis_human_pct, vis_bot_pct)) },
-        Kpi { label: "Active Bots".to_string(), value: year_report.bot_stats.len().to_string(), change: None },
+        Kpi {
+            label: "Total Hits".to_string(),
+            value: year_report.total_hits.to_string(),
+            change: Some(format!("{}% human · {}% bot", hits_human_pct, hits_bot_pct)),
+        },
+        Kpi {
+            label: "Unique Visitors".to_string(),
+            value: year_report.total_visitors.to_string(),
+            change: Some(format!("{}% human · {}% bot", vis_human_pct, vis_bot_pct)),
+        },
+        Kpi {
+            label: "Active Bots".to_string(),
+            value: year_report.bot_stats.len().to_string(),
+            change: None,
+        },
     ]);
 
     doc.add_monthly_traffic_section(&year_report.monthly);
 
-    let content_pages: Vec<_> = year_report.top_pages.iter()
+    let content_pages: Vec<_> = year_report
+        .top_pages
+        .iter()
         .filter(|p| p.category == "article" || p.category == "page")
         .take(15)
         .cloned()
         .collect();
-    let static_assets: Vec<_> = year_report.top_pages.iter()
+    let static_assets: Vec<_> = year_report
+        .top_pages
+        .iter()
         .filter(|p| p.category == "static")
         .cloned()
         .collect();
@@ -521,12 +661,8 @@ async fn process_site_year(
 
     let html_file = output_dir.join(format!("{}-{}.html", site.domain, year));
     info!(domain = %site.domain, year, path = %html_file.display(), "Generating year HTML report");
-    let html_content = crate::html::generate_year_report(
-        &site.domain,
-        year,
-        &year_svg,
-        &month_svgs,
-    );
+    let html_content =
+        crate::html::generate_year_report(&site.domain, year, &year_report, &month_html_data);
     std::fs::write(&html_file, html_content)?;
 
     Ok(())
@@ -542,23 +678,49 @@ async fn main() -> anyhow::Result<()> {
         anyhow::bail!("At least one of --month or --year is required");
     }
 
-    let config_path = args.config.unwrap_or_else(|| PathBuf::from("edgeview.toml"));
+    let config_path = args
+        .config
+        .unwrap_or_else(|| PathBuf::from("edgeview.toml"));
     if !config_path.exists() {
-        anyhow::bail!("Configuration file not found: {}. Please create one or specify with --config.", config_path.display());
+        anyhow::bail!(
+            "Configuration file not found: {}. Please create one or specify with --config.",
+            config_path.display()
+        );
     }
 
     let config = Config::load(&config_path)?;
 
     for site in &config.sites {
         if let Some(year) = &args.year {
-            if let Err(e) = process_site_year(site, year, args.no_cache, &config.bots, &config.default_s3_region, &config.output_dir).await {
+            if let Err(e) = process_site_year(
+                site,
+                year,
+                args.no_cache,
+                &config.bots,
+                &config.default_s3_region,
+                &config.output_dir,
+            )
+            .await
+            {
                 error!(domain = %site.domain, error = %e, "Failed to process site year");
-                return Err(e.context(format!("Failed to process site {} for year {}", site.domain, year)));
+                return Err(e.context(format!(
+                    "Failed to process site {} for year {}",
+                    site.domain, year
+                )));
             }
         }
 
         if let Some(month) = &args.month {
-            if let Err(e) = process_site(site, month, args.no_cache, &config.bots, &config.default_s3_region, &config.output_dir).await {
+            if let Err(e) = process_site(
+                site,
+                month,
+                args.no_cache,
+                &config.bots,
+                &config.default_s3_region,
+                &config.output_dir,
+            )
+            .await
+            {
                 error!(domain = %site.domain, error = %e, "Failed to process site");
                 return Err(e.context(format!("Failed to process site {}", site.domain)));
             }

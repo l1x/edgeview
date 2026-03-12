@@ -1,5 +1,5 @@
-use std::path::Path;
 use serde::Deserialize;
+use std::path::Path;
 
 #[derive(Debug, Deserialize)]
 pub struct Sitemap {
@@ -37,7 +37,7 @@ mod tests {
                     <loc>https://example.com/blog</loc>
                 </url>
             </urlset>"#;
-        
+
         let urls = parse_sitemap_content(xml).unwrap();
         assert_eq!(urls.len(), 2);
         assert_eq!(urls[0], "https://example.com/");
