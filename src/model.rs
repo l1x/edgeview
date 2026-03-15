@@ -3,7 +3,46 @@ use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
 use std::collections::HashMap;
 
-#[derive(Debug, Serialize, Deserialize)]
+/// Maximum number of content/static pages shown in tables.
+pub const TOP_PAGES_LIMIT: usize = 15;
+
+/// Maximum number of bots shown in SVG reports.
+pub const TOP_BOTS_SVG_LIMIT: usize = 5;
+
+/// Maximum number of bots shown in HTML year/month tables.
+pub const TOP_BOTS_HTML_LIMIT: usize = 10;
+
+/// Maximum number of missing sitemap URLs shown.
+pub const MAX_SITEMAP_GAPS: usize = 15;
+
+/// Maximum number of referers shown in reports.
+pub const TOP_REFERERS_LIMIT: usize = 15;
+
+/// Compute (human_pct, bot_pct) with proper f64 rounding.
+pub fn human_bot_pct(hits: u64, bot_hits: u64) -> (u64, u64) {
+    if hits == 0 {
+        return (100, 0);
+    }
+    let bot_pct = ((bot_hits.min(hits) as f64 / hits as f64) * 100.0).round() as u64;
+    (100u64.saturating_sub(bot_pct), bot_pct)
+}
+
+/// Return the last day of a given month.
+pub fn last_day_of_month(year: i32, month: u32) -> NaiveDate {
+    if month == 12 {
+        NaiveDate::from_ymd_opt(year + 1, 1, 1)
+            .unwrap()
+            .pred_opt()
+            .unwrap()
+    } else {
+        NaiveDate::from_ymd_opt(year, month + 1, 1)
+            .unwrap()
+            .pred_opt()
+            .unwrap()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DailyTraffic {
     pub date: NaiveDate,
     pub hits: u64,
@@ -33,6 +72,12 @@ pub struct CrawlerStats {
     pub last_crawl: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RefererStats {
+    pub referer: String,
+    pub hits: u64,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MonthReport {
     pub total_hits: u64,
@@ -47,9 +92,11 @@ pub struct MonthReport {
     pub daily_pages: HashMap<String, Vec<PageHits>>,
     #[serde(default)]
     pub daily_hourly: HashMap<String, Vec<HourlyTraffic>>,
+    #[serde(default)]
+    pub referer_stats: Vec<RefererStats>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug)]
 pub struct DayCache {
     pub date: NaiveDate,
     pub hits: u64,
@@ -60,6 +107,7 @@ pub struct DayCache {
     pub hourly: Vec<HourlyTraffic>,
     pub bot_stats: Vec<CrawlerStats>,
     pub google_hits: HashMap<String, u64>,
+    pub referer_stats: Vec<RefererStats>,
 }
 
 impl MonthReport {
@@ -110,23 +158,24 @@ impl MonthReport {
         top_pages.sort_by_key(|p| Reverse(p.hits));
 
         // Merge bot_stats by bot_name, sum hits, max last_crawl
-        let mut bot_rollup: HashMap<String, CrawlerStats> = HashMap::new();
+        let mut bot_rollup: HashMap<String, (u64, Option<DateTime<Utc>>)> = HashMap::new();
         for day in &days {
             for b in &day.bot_stats {
-                let entry = bot_rollup
-                    .entry(b.bot_name.clone())
-                    .or_insert(CrawlerStats {
-                        bot_name: b.bot_name.clone(),
-                        hits: 0,
-                        last_crawl: None,
-                    });
-                entry.hits += b.hits;
-                if b.last_crawl > entry.last_crawl {
-                    entry.last_crawl = b.last_crawl;
+                let entry = bot_rollup.entry(b.bot_name.clone()).or_insert((0, None));
+                entry.0 += b.hits;
+                if b.last_crawl > entry.1 {
+                    entry.1 = b.last_crawl;
                 }
             }
         }
-        let mut bot_stats: Vec<CrawlerStats> = bot_rollup.into_values().collect();
+        let mut bot_stats: Vec<CrawlerStats> = bot_rollup
+            .into_iter()
+            .map(|(bot_name, (hits, last_crawl))| CrawlerStats {
+                bot_name,
+                hits,
+                last_crawl,
+            })
+            .collect();
         bot_stats.sort_by_key(|s| Reverse(s.hits));
 
         // Merge google_hits by path
@@ -137,7 +186,20 @@ impl MonthReport {
             }
         }
 
-        // Build daily_pages and daily_hourly from each DayCache
+        // Merge referer_stats across days
+        let mut referer_rollup: HashMap<String, u64> = HashMap::new();
+        for day in &days {
+            for r in &day.referer_stats {
+                *referer_rollup.entry(r.referer.clone()).or_default() += r.hits;
+            }
+        }
+        let mut referer_stats: Vec<RefererStats> = referer_rollup
+            .into_iter()
+            .map(|(referer, hits)| RefererStats { referer, hits })
+            .collect();
+        referer_stats.sort_by_key(|r| Reverse(r.hits));
+
+        // Build daily_pages and daily_hourly, consuming from DayCaches to avoid cloning
         let mut daily_pages: HashMap<String, Vec<PageHits>> = HashMap::new();
         let mut daily_hourly: HashMap<String, Vec<HourlyTraffic>> = HashMap::new();
         for day in &days {
@@ -157,6 +219,7 @@ impl MonthReport {
             google_hits,
             daily_pages,
             daily_hourly,
+            referer_stats,
         }
     }
 }
@@ -186,6 +249,7 @@ pub struct MonthSummary {
     pub top_pages: Vec<PageHits>,
     pub bot_stats: Vec<CrawlerStats>,
     pub google_hits: HashMap<String, u64>,
+    pub referer_stats: Vec<RefererStats>,
 }
 
 impl MonthSummary {
@@ -216,6 +280,7 @@ impl MonthSummary {
                 })
                 .collect(),
             google_hits: report.google_hits.clone(),
+            referer_stats: report.referer_stats.clone(),
         }
     }
 }
@@ -232,6 +297,7 @@ pub struct YearReport {
     pub bot_stats: Vec<CrawlerStats>,
     pub google_hits: HashMap<String, u64>,
     pub month_summaries: Vec<MonthSummary>,
+    pub referer_stats: Vec<RefererStats>,
 }
 
 impl YearReport {
@@ -278,23 +344,24 @@ impl YearReport {
         top_pages.sort_by_key(|p| Reverse(p.hits));
 
         // Merge bot_stats across months
-        let mut bot_rollup: HashMap<String, CrawlerStats> = HashMap::new();
+        let mut bot_rollup: HashMap<String, (u64, Option<DateTime<Utc>>)> = HashMap::new();
         for (_, r) in &months {
             for b in &r.bot_stats {
-                let entry = bot_rollup
-                    .entry(b.bot_name.clone())
-                    .or_insert(CrawlerStats {
-                        bot_name: b.bot_name.clone(),
-                        hits: 0,
-                        last_crawl: None,
-                    });
-                entry.hits += b.hits;
-                if b.last_crawl > entry.last_crawl {
-                    entry.last_crawl = b.last_crawl;
+                let entry = bot_rollup.entry(b.bot_name.clone()).or_insert((0, None));
+                entry.0 += b.hits;
+                if b.last_crawl > entry.1 {
+                    entry.1 = b.last_crawl;
                 }
             }
         }
-        let mut bot_stats: Vec<CrawlerStats> = bot_rollup.into_values().collect();
+        let mut bot_stats: Vec<CrawlerStats> = bot_rollup
+            .into_iter()
+            .map(|(bot_name, (hits, last_crawl))| CrawlerStats {
+                bot_name,
+                hits,
+                last_crawl,
+            })
+            .collect();
         bot_stats.sort_by_key(|s| Reverse(s.hits));
 
         // Merge google_hits across months
@@ -304,6 +371,19 @@ impl YearReport {
                 *google_hits.entry(path.clone()).or_default() += hits;
             }
         }
+
+        // Merge referer_stats across months
+        let mut referer_rollup: HashMap<String, u64> = HashMap::new();
+        for (_, r) in &months {
+            for ref_stat in &r.referer_stats {
+                *referer_rollup.entry(ref_stat.referer.clone()).or_default() += ref_stat.hits;
+            }
+        }
+        let mut referer_stats: Vec<RefererStats> = referer_rollup
+            .into_iter()
+            .map(|(referer, hits)| RefererStats { referer, hits })
+            .collect();
+        referer_stats.sort_by_key(|r| Reverse(r.hits));
 
         // Build month summaries
         let month_summaries: Vec<MonthSummary> = months
@@ -322,6 +402,7 @@ impl YearReport {
             bot_stats,
             google_hits,
             month_summaries,
+            referer_stats,
         }
     }
 }

@@ -1,4 +1,4 @@
-use crate::model::*;
+use crate::model::{human_bot_pct, *};
 use crate::svg::theme::GREY_ORANGE;
 use crate::svg::SvgDoc;
 use chrono::{Datelike, NaiveDate};
@@ -19,24 +19,14 @@ pub fn build_daily_svg(
     let mut doc = SvgDoc::new(800.0, GREY_ORANGE);
     doc.add_section_title(&format!("{} / {}", domain, date));
 
-    let hits_bot_pct = if total_hits > 0 {
-        (total_bot_hits * 100) / total_hits
-    } else {
-        0
-    };
-    let hits_human_pct = 100 - hits_bot_pct;
+    let (hits_human_pct, hits_bot_pct) = human_bot_pct(total_hits, total_bot_hits);
 
     let bot_visitors = if total_hits > 0 {
         (total_visitors as f64 * total_bot_hits as f64 / total_hits as f64) as u64
     } else {
         0
     };
-    let vis_bot_pct = if total_visitors > 0 {
-        (bot_visitors * 100) / total_visitors
-    } else {
-        0
-    };
-    let vis_human_pct = 100 - vis_bot_pct;
+    let (vis_human_pct, vis_bot_pct) = human_bot_pct(total_visitors, bot_visitors);
 
     doc.add_kpi_cards(&[
         Kpi {
@@ -60,72 +50,19 @@ pub fn build_daily_svg(
 
     let content_pages: Vec<_> = pages
         .iter()
-        .filter(|p| p.category == "article" || p.category == "page")
-        .take(15)
+        .filter(|p| p.category == "page")
+        .take(TOP_PAGES_LIMIT)
         .cloned()
         .collect();
     let static_assets: Vec<_> = pages
         .iter()
-        .filter(|p| p.category == "static")
+        .filter(|p| p.category != "page")
         .cloned()
         .collect();
 
     doc.add_top_content_pages(&content_pages);
     doc.add_static_assets(&static_assets);
     doc.add_bot_activity_section(bot_stats);
-
-    doc.finalize()
-}
-
-/// Build a compact month summary SVG for embedding in year report tabs.
-pub fn build_month_summary_svg(domain: &str, month: &str, summary: &MonthSummary) -> String {
-    let mut doc = SvgDoc::new(800.0, GREY_ORANGE);
-    doc.add_section_title(&format!("{} / {}", domain, month));
-
-    let hits_bot_pct = if summary.total_hits > 0 {
-        (summary.total_bot_hits * 100) / summary.total_hits
-    } else {
-        0
-    };
-    let hits_human_pct = 100 - hits_bot_pct;
-    let vis_bot_pct = if summary.total_visitors > 0 {
-        (summary.total_bot_visitors * 100) / summary.total_visitors
-    } else {
-        0
-    };
-    let vis_human_pct = 100 - vis_bot_pct;
-
-    doc.add_kpi_cards(&[
-        Kpi {
-            label: "Total Hits".to_string(),
-            value: summary.total_hits.to_string(),
-            change: Some(format!("{}% human · {}% bot", hits_human_pct, hits_bot_pct)),
-        },
-        Kpi {
-            label: "Unique Visitors".to_string(),
-            value: summary.total_visitors.to_string(),
-            change: Some(format!("{}% human · {}% bot", vis_human_pct, vis_bot_pct)),
-        },
-        Kpi {
-            label: "Active Bots".to_string(),
-            value: summary.bot_stats.len().to_string(),
-            change: None,
-        },
-    ]);
-
-    doc.add_daily_traffic_section(&summary.daily);
-
-    let content_pages: Vec<_> = summary
-        .top_pages
-        .iter()
-        .filter(|p| p.category == "article" || p.category == "page")
-        .take(5)
-        .cloned()
-        .collect();
-    doc.add_top_content_pages(&content_pages);
-
-    let top_bots: Vec<_> = summary.bot_stats.iter().take(3).cloned().collect();
-    doc.add_bot_activity_section(&top_bots);
 
     doc.finalize()
 }
@@ -147,6 +84,7 @@ pub fn generate_report(
     daily_pages: &HashMap<String, Vec<PageHits>>,
     daily_hourly: &HashMap<String, Vec<HourlyTraffic>>,
     bot_stats: &[CrawlerStats],
+    all_domains: &[String],
 ) -> String {
     let mut dates: Vec<&String> = daily_pages.keys().collect();
     dates.sort();
@@ -201,6 +139,29 @@ pub fn generate_report(
         ));
     }
 
+    let site_nav = if all_domains.len() > 1 {
+        let mut nav = String::from("<div class=\"site-nav\">\n");
+        for d in all_domains {
+            if d == domain {
+                nav.push_str(&format!(
+                    "<button class=\"active\">{}</button>\n",
+                    html_escape(d)
+                ));
+            } else {
+                nav.push_str(&format!(
+                    "<a href=\"{}-{}.html\">{}</a>\n",
+                    d,
+                    month,
+                    html_escape(d)
+                ));
+            }
+        }
+        nav.push_str("</div>\n");
+        nav
+    } else {
+        String::new()
+    };
+
     format!(
         r#"<!DOCTYPE html>
 <html lang="en">
@@ -213,6 +174,10 @@ pub fn generate_report(
 body {{ font-family: system-ui, -apple-system, sans-serif; background: #f5f5f5; color: #2d2d2d; padding: 24px; }}
 h1 {{ font-size: 20px; font-weight: 600; margin-bottom: 16px; text-align: center; }}
 input[type="radio"] {{ display: none; }}
+.site-nav {{ display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 16px; justify-content: center; }}
+.site-nav a, .site-nav button {{ padding: 8px 16px; background: #e5e5e5; border: none; border-radius: 6px; cursor: pointer; font-size: 14px; font-weight: 500; color: #2d2d2d; transition: background 0.15s, color 0.15s; text-decoration: none; font-family: inherit; }}
+.site-nav a:hover, .site-nav button:hover {{ background: #d4d4d4; }}
+.site-nav button.active {{ background: #f97316; color: #fff; }}
 .tabs {{ display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 16px; justify-content: center; }}
 .tabs label {{ padding: 8px 16px; background: #e5e5e5; border-radius: 6px; cursor: pointer; font-size: 14px; font-weight: 500; color: #2d2d2d; transition: background 0.15s, color 0.15s; }}
 .tabs label:hover {{ background: #d4d4d4; }}
@@ -222,7 +187,7 @@ input[type="radio"] {{ display: none; }}
 </style>
 </head>
 <body>
-{tab_inputs}
+{site_nav}{tab_inputs}
 <div class="tabs">
 {tab_labels}
 </div>
@@ -234,6 +199,7 @@ input[type="radio"] {{ display: none; }}
         domain = domain,
         month = month,
         css_rules = css_rules,
+        site_nav = site_nav,
         tab_inputs = tab_inputs,
         tab_labels = tab_labels,
         tab_panels = tab_panels,
@@ -251,6 +217,7 @@ pub struct DayHtmlData {
     pub pages: Vec<PageHits>,
     pub hourly: Vec<HourlyTraffic>,
     pub bot_stats: Vec<CrawlerStats>,
+    pub referer_stats: Vec<RefererStats>,
 }
 
 /// Data for one month in the year report.
@@ -273,14 +240,6 @@ fn fmt_num(n: u64) -> String {
         result.push(b as char);
     }
     result
-}
-
-fn human_bot_pct(hits: u64, bot_hits: u64) -> (u64, u64) {
-    if hits == 0 {
-        return (100, 0);
-    }
-    let bot_pct = (bot_hits.min(hits) * 100) / hits;
-    (100 - bot_pct, bot_pct)
 }
 
 fn html_escape(s: &str) -> String {
@@ -368,6 +327,71 @@ fn render_bot_table(bots: &[CrawlerStats], limit: usize) -> String {
     h
 }
 
+fn render_referer_table(referers: &[RefererStats], limit: usize) -> String {
+    let mut h = String::from(concat!(
+        "<table class=\"data-table\"><thead><tr>",
+        "<th class=\"col-path\">Referer</th><th>Hits</th>",
+        "</tr></thead><tbody>"
+    ));
+    for r in referers.iter().take(limit) {
+        h.push_str("<tr><td class=\"path-cell\">");
+        h.push_str(&html_escape(&r.referer));
+        h.push_str("</td><td>");
+        h.push_str(&fmt_num(r.hits));
+        h.push_str("</td></tr>");
+    }
+    h.push_str("</tbody></table>");
+    h
+}
+
+/// Render static assets grouped by category (CSS, JS, Images, Fonts, Data) as separate cards.
+fn render_grouped_static_cards(pages: &[PageHits]) -> String {
+    let groups: &[(&str, &str)] = &[
+        ("css", "CSS"),
+        ("js", "JavaScript"),
+        ("image", "Images"),
+        ("font", "Fonts"),
+        ("data", "Data"),
+    ];
+    let mut html = String::new();
+    for &(cat, label) in groups {
+        let items: Vec<&PageHits> = pages.iter().filter(|p| p.category == cat).collect();
+        if items.is_empty() {
+            continue;
+        }
+        let title = format!("Static — {}", label);
+        let table = render_page_table_ref(&items, items.len());
+        html.push_str(&card(&title, &table));
+    }
+    html
+}
+
+/// Like render_page_table but takes &[&PageHits].
+fn render_page_table_ref(pages: &[&PageHits], limit: usize) -> String {
+    let mut h = String::from(concat!(
+        "<table class=\"data-table\"><thead><tr>",
+        "<th class=\"col-path\">Path</th><th>Hits</th>",
+        "<th>Visitors</th><th>Human</th><th>Bot</th>",
+        "</tr></thead><tbody>"
+    ));
+    for page in pages.iter().take(limit) {
+        let (hp, bp) = human_bot_pct(page.hits, page.bot_hits);
+        h.push_str("<tr><td class=\"path-cell\">");
+        h.push_str(&html_escape(&page.path));
+        h.push_str("</td><td>");
+        h.push_str(&fmt_num(page.hits));
+        h.push_str("</td><td>");
+        h.push_str(&fmt_num(page.visitors));
+        h.push_str("</td><td>");
+        h.push_str(&hp.to_string());
+        h.push_str("%</td><td>");
+        h.push_str(&bp.to_string());
+        h.push_str("%</td></tr>");
+    }
+    h.push_str("</tbody></table>");
+    h
+}
+
 fn card(title: &str, content: &str) -> String {
     let mut h = String::from("<div class=\"card\"><h3 class=\"card-title\">");
     h.push_str(title);
@@ -385,6 +409,8 @@ pub fn generate_year_report(
     year: &str,
     year_report: &YearReport,
     months: &[MonthHtmlData],
+    all_domains: &[String],
+    available_years: &[i32],
 ) -> String {
     let month_labels = [
         "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
@@ -409,7 +435,9 @@ body{font-family:system-ui,-apple-system,sans-serif;background:#f0f0f0;color:#1a
 .content{padding:32px;overflow-y:auto}
 .brand{font-size:22px;font-weight:700;color:#f97316;margin-bottom:4px;letter-spacing:-0.5px}
 .site-label{font-size:13px;color:#6b7280;margin-bottom:24px;word-break:break-all}
-.year-btn{width:100%;margin-bottom:16px;font-size:15px;padding:10px}
+.site-nav{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:16px}
+.year-nav{display:flex;gap:6px;margin-bottom:16px}
+.year-btn{flex:1;font-size:15px;padding:10px;text-align:center;text-decoration:none}
 .month-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:6px;margin-bottom:16px}
 .cal-wrap{border-top:1px solid #e5e7eb;padding-top:16px;display:none}
 .cal-header{text-align:center;font-weight:600;font-size:14px;margin-bottom:8px;color:#1a1a1a}
@@ -458,13 +486,49 @@ a:hover{text-decoration:underline}
     // ── Sidebar ──
     html.push_str("<nav class=\"sidebar\">\n");
     html.push_str("<div class=\"brand\">EdgeView</div>\n");
+
+    // Site selector (only when multiple sites)
+    if all_domains.len() > 1 {
+        html.push_str("<div class=\"site-nav\">\n");
+        for d in all_domains {
+            if d == domain {
+                html.push_str(&format!(
+                    "<button class=\"nav-btn active\">{}</button>\n",
+                    html_escape(d)
+                ));
+            } else {
+                html.push_str(&format!(
+                    "<a class=\"nav-btn\" href=\"{}-{}.html\">{}</a>\n",
+                    d,
+                    year,
+                    html_escape(d)
+                ));
+            }
+        }
+        html.push_str("</div>\n");
+    }
+
     html.push_str("<div class=\"site-label\">");
     html.push_str(domain);
     html.push_str("</div>\n");
-    html.push_str(&format!(
-        "<button class=\"nav-btn year-btn active\" data-level=\"year\" data-panel=\"panel-year\">{}</button>\n",
-        year
-    ));
+
+    // Year selector
+    let year_num: i32 = year.parse().unwrap_or(2026);
+    html.push_str("<div class=\"year-nav\">\n");
+    for &y in available_years {
+        if y == year_num {
+            html.push_str(&format!(
+                "<button class=\"nav-btn year-btn active\" data-level=\"year\" data-panel=\"panel-year\">{}</button>\n",
+                y
+            ));
+        } else {
+            html.push_str(&format!(
+                "<a class=\"nav-btn year-btn\" href=\"{}-{}.html\">{}</a>\n",
+                domain, y, y
+            ));
+        }
+    }
+    html.push_str("</div>\n");
 
     // Month grid (3×4)
     html.push_str("<div class=\"month-grid\" id=\"month-grid\">\n");
@@ -555,31 +619,37 @@ a:hover{text-decoration:underline}
         let content_pages: Vec<PageHits> = year_report
             .top_pages
             .iter()
-            .filter(|p| p.category == "article" || p.category == "page")
-            .take(15)
+            .filter(|p| p.category == "page")
+            .take(TOP_PAGES_LIMIT)
             .cloned()
             .collect();
         if !content_pages.is_empty() {
-            html.push_str(&card("Top Content", &render_page_table(&content_pages, 15)));
+            html.push_str(&card(
+                "Top Content",
+                &render_page_table(&content_pages, TOP_PAGES_LIMIT),
+            ));
         }
 
         let static_pages: Vec<PageHits> = year_report
             .top_pages
             .iter()
-            .filter(|p| p.category == "static")
+            .filter(|p| p.category != "page")
             .cloned()
             .collect();
         if !static_pages.is_empty() {
-            html.push_str(&card(
-                "Static Assets",
-                &render_page_table(&static_pages, 15),
-            ));
+            html.push_str(&render_grouped_static_cards(&static_pages));
         }
 
         html.push_str(&card(
             "Bot Activity",
-            &render_bot_table(&year_report.bot_stats, 10),
+            &render_bot_table(&year_report.bot_stats, TOP_BOTS_HTML_LIMIT),
         ));
+        if !year_report.referer_stats.is_empty() {
+            html.push_str(&card(
+                "Top Referers",
+                &render_referer_table(&year_report.referer_stats, TOP_REFERERS_LIMIT),
+            ));
+        }
         html.push_str("</div>\n");
     }
 
@@ -613,21 +683,38 @@ a:hover{text-decoration:underline}
         let content_pages: Vec<PageHits> = s
             .top_pages
             .iter()
-            .filter(|p| p.category == "article" || p.category == "page")
-            .take(10)
+            .filter(|p| p.category == "page")
+            .take(TOP_PAGES_LIMIT)
             .cloned()
             .collect();
         if !content_pages.is_empty() {
-            html.push_str(&card("Top Content", &render_page_table(&content_pages, 10)));
+            html.push_str(&card(
+                "Top Content",
+                &render_page_table(&content_pages, TOP_PAGES_LIMIT),
+            ));
         }
 
-        html.push_str(&card("Bot Activity", &render_bot_table(&s.bot_stats, 5)));
+        let static_pages: Vec<PageHits> = s
+            .top_pages
+            .iter()
+            .filter(|p| p.category != "page")
+            .cloned()
+            .collect();
+        if !static_pages.is_empty() {
+            html.push_str(&render_grouped_static_cards(&static_pages));
+        }
 
-        let month_html_link = format!("{}-{}.html", domain, md.month);
-        html.push_str(&format!(
-            "<a class=\"month-link\" href=\"{}\">Full month report &rarr;</a>\n",
-            month_html_link
+        html.push_str(&card(
+            "Bot Activity",
+            &render_bot_table(&s.bot_stats, TOP_BOTS_SVG_LIMIT),
         ));
+        if !s.referer_stats.is_empty() {
+            html.push_str(&card(
+                "Top Referers",
+                &render_referer_table(&s.referer_stats, TOP_REFERERS_LIMIT),
+            ));
+        }
+
         html.push_str("</div>\n");
     }
 
@@ -669,28 +756,37 @@ a:hover{text-decoration:underline}
             let content_pages: Vec<PageHits> = day
                 .pages
                 .iter()
-                .filter(|p| p.category == "article" || p.category == "page")
-                .take(15)
+                .filter(|p| p.category == "page")
+                .take(TOP_PAGES_LIMIT)
                 .cloned()
                 .collect();
             if !content_pages.is_empty() {
-                html.push_str(&card("Top Content", &render_page_table(&content_pages, 15)));
+                html.push_str(&card(
+                    "Top Content",
+                    &render_page_table(&content_pages, TOP_PAGES_LIMIT),
+                ));
             }
 
             let static_pages: Vec<PageHits> = day
                 .pages
                 .iter()
-                .filter(|p| p.category == "static")
+                .filter(|p| p.category != "page")
                 .cloned()
                 .collect();
             if !static_pages.is_empty() {
-                html.push_str(&card(
-                    "Static Assets",
-                    &render_page_table(&static_pages, 15),
-                ));
+                html.push_str(&render_grouped_static_cards(&static_pages));
             }
 
-            html.push_str(&card("Bot Activity", &render_bot_table(&day.bot_stats, 5)));
+            html.push_str(&card(
+                "Bot Activity",
+                &render_bot_table(&day.bot_stats, TOP_BOTS_SVG_LIMIT),
+            ));
+            if !day.referer_stats.is_empty() {
+                html.push_str(&card(
+                    "Top Referers",
+                    &render_referer_table(&day.referer_stats, TOP_REFERERS_LIMIT),
+                ));
+            }
             html.push_str("</div>\n");
         }
     }

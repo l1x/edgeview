@@ -1,15 +1,5 @@
-use crate::model::*;
+use crate::model::{human_bot_pct, *};
 use crate::svg::SvgDoc;
-
-fn human_bot_pct(hits: u64, bot_hits: u64) -> (u64, u64) {
-    if hits == 0 {
-        return (100, 0);
-    }
-    let bot_hits = bot_hits.min(hits);
-    let bot_pct = (bot_hits * 100) / hits;
-    let human_pct = 100 - bot_pct;
-    (human_pct, bot_pct)
-}
 
 impl SvgDoc {
     pub fn add_kpi_cards(&mut self, kpis: &[Kpi]) {
@@ -108,29 +98,42 @@ impl SvgDoc {
     }
 
     pub fn add_static_assets(&mut self, pages: &[PageHits]) {
-        self.add_section_title("Static Assets");
-        for page in pages {
-            let (human_pct, bot_pct) = human_bot_pct(page.hits, page.bot_hits);
-            self.content.push_str(&format!(
-                r#"<text x="{x}" y="{y}" class="text">{path}</text>
+        let groups: &[(&str, &str)] = &[
+            ("css", "CSS"),
+            ("js", "JavaScript"),
+            ("image", "Images"),
+            ("font", "Fonts"),
+            ("data", "Data"),
+        ];
+        for &(cat, label) in groups {
+            let items: Vec<&PageHits> = pages.iter().filter(|p| p.category == cat).collect();
+            if items.is_empty() {
+                continue;
+            }
+            self.add_section_title(&format!("Static — {}", label));
+            for page in items {
+                let (human_pct, bot_pct) = human_bot_pct(page.hits, page.bot_hits);
+                self.content.push_str(&format!(
+                    r#"<text x="{x}" y="{y}" class="text">{path}</text>
                    <text x="{rx}" y="{y}" class="text-mono" text-anchor="end">{hits} hits · {visitors} visitors · {human_pct}% human · {bot_pct}% bot</text>"#,
-                x = self.theme.spacing,
-                y = self.y_cursor + 20.0,
-                path = page.path,
-                rx = self.width - self.theme.spacing,
-                hits = page.hits,
-                visitors = page.visitors,
-                human_pct = human_pct,
-                bot_pct = bot_pct,
-            ));
-            self.y_cursor += 30.0;
+                    x = self.theme.spacing,
+                    y = self.y_cursor + 20.0,
+                    path = page.path,
+                    rx = self.width - self.theme.spacing,
+                    hits = page.hits,
+                    visitors = page.visitors,
+                    human_pct = human_pct,
+                    bot_pct = bot_pct,
+                ));
+                self.y_cursor += 30.0;
+            }
+            self.y_cursor += self.theme.spacing;
         }
-        self.y_cursor += self.theme.spacing;
     }
 
     pub fn add_bot_activity_section(&mut self, bots: &[CrawlerStats]) {
         self.add_section_title("Bot Activity");
-        for bot in bots.iter().take(5) {
+        for bot in bots.iter().take(TOP_BOTS_SVG_LIMIT) {
             self.content.push_str(&format!(
                 r#"<text x="{x}" y="{y}" class="text">{name}</text>
                    <text x="{rx}" y="{y}" class="text-mono" text-anchor="end">{hits} hits</text>"#,
@@ -181,26 +184,6 @@ impl SvgDoc {
             ));
         }
         self.y_cursor += chart_height + 30.0;
-    }
-
-    pub fn add_daily_page_table(&mut self, pages: &[PageHits]) {
-        for page in pages.iter().take(20) {
-            let (human_pct, bot_pct) = human_bot_pct(page.hits, page.bot_hits);
-            self.content.push_str(&format!(
-                r#"<text x="{x}" y="{y}" class="text">{path}</text>
-                   <text x="{rx}" y="{y}" class="text-mono" text-anchor="end">{hits} hits · {visitors} visitors · {human_pct}% human · {bot_pct}% bot</text>"#,
-                x = self.theme.spacing,
-                y = self.y_cursor + 20.0,
-                path = page.path,
-                rx = self.width - self.theme.spacing,
-                hits = page.hits,
-                visitors = page.visitors,
-                human_pct = human_pct,
-                bot_pct = bot_pct,
-            ));
-            self.y_cursor += 30.0;
-        }
-        self.y_cursor += self.theme.spacing;
     }
 
     pub fn add_monthly_traffic_section(&mut self, traffic: &[MonthlyTraffic]) {
@@ -256,7 +239,7 @@ impl SvgDoc {
             ));
             self.y_cursor += 40.0;
         } else {
-            for url in missing_urls.iter().take(15) {
+            for url in missing_urls.iter().take(MAX_SITEMAP_GAPS) {
                 self.content.push_str(&format!(
                     r#"<text x="{x}" y="{y}" class="text" fill="{{#}}d73a49">○ {url}</text>"#,
                     x = self.theme.spacing,
@@ -265,12 +248,12 @@ impl SvgDoc {
                 ));
                 self.y_cursor += 25.0;
             }
-            if missing_urls.len() > 15 {
+            if missing_urls.len() > MAX_SITEMAP_GAPS {
                 self.content.push_str(&format!(
                     r#"<text x="{x}" y="{y}" class="text-muted">... and {more} more</text>"#,
                     x = self.theme.spacing + 20.0,
                     y = self.y_cursor + 20.0,
-                    more = missing_urls.len() - 15
+                    more = missing_urls.len() - MAX_SITEMAP_GAPS
                 ));
                 self.y_cursor += 30.0;
             }

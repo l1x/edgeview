@@ -20,8 +20,11 @@ pub struct Config {
 
 impl Config {
     pub fn load(path: &std::path::Path) -> anyhow::Result<Self> {
-        let content = std::fs::read_to_string(path)?;
-        let config: Config = toml::from_str(&content)?;
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("Failed to read config file {}: {}", path.display(), e))?;
+        let config: Config = toml::from_str(&content).map_err(|e| {
+            anyhow::anyhow!("Failed to parse config file {}: {}", path.display(), e)
+        })?;
         Ok(config)
     }
 }
