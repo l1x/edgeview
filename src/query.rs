@@ -747,8 +747,9 @@ mod tests {
     use tempfile::TempDir;
 
     /// Write a narrow parquet file with the given rows.
-    /// Each row is (date, time, c_ip, cs_method, cs_uri_stem, sc_status, cs_User_Agent).
-    fn write_test_parquet(path: &Path, rows: &[(&str, &str, &str, &str, &str, &str, &str)]) {
+    /// Each row is (date, time, c_ip, cs_method, cs_uri_stem, sc_status, cs_Referer, cs_User_Agent).
+    #[allow(clippy::type_complexity)]
+    fn write_test_parquet(path: &Path, rows: &[(&str, &str, &str, &str, &str, &str, &str, &str)]) {
         let schema = Arc::new(narrow_schema());
         let file = std::fs::File::create(path).unwrap();
         let props = WriterProperties::builder()
@@ -762,7 +763,8 @@ mod tests {
         let methods: Vec<&str> = rows.iter().map(|r| r.3).collect();
         let paths: Vec<&str> = rows.iter().map(|r| r.4).collect();
         let statuses: Vec<&str> = rows.iter().map(|r| r.5).collect();
-        let uas: Vec<&str> = rows.iter().map(|r| r.6).collect();
+        let referers: Vec<&str> = rows.iter().map(|r| r.6).collect();
+        let uas: Vec<&str> = rows.iter().map(|r| r.7).collect();
 
         let batch = RecordBatch::try_new(
             schema,
@@ -773,6 +775,7 @@ mod tests {
                 Arc::new(StringArray::from(methods)),
                 Arc::new(StringArray::from(paths)),
                 Arc::new(StringArray::from(statuses)),
+                Arc::new(StringArray::from(referers)),
                 Arc::new(StringArray::from(uas)),
             ],
         )
@@ -802,6 +805,7 @@ mod tests {
                     "GET",
                     "/",
                     "200",
+                    "-",
                     "Mozilla/5.0",
                 ),
                 (
@@ -811,6 +815,7 @@ mod tests {
                     "GET",
                     "/about",
                     "200",
+                    "-",
                     "Mozilla/5.0",
                 ),
                 (
@@ -820,6 +825,7 @@ mod tests {
                     "GET",
                     "/",
                     "304",
+                    "-",
                     "Mozilla/5.0",
                 ),
                 // POST should be excluded from hits
@@ -830,6 +836,7 @@ mod tests {
                     "POST",
                     "/submit",
                     "200",
+                    "-",
                     "Mozilla/5.0",
                 ),
                 // 404 should be excluded from hits
@@ -840,6 +847,7 @@ mod tests {
                     "GET",
                     "/missing",
                     "404",
+                    "-",
                     "Mozilla/5.0",
                 ),
                 // Different date should be filtered out
@@ -850,13 +858,14 @@ mod tests {
                     "GET",
                     "/",
                     "200",
+                    "-",
                     "Mozilla/5.0",
                 ),
             ],
         );
 
         let bots = test_bot_map();
-        let acc = scan_file(&file, "2026-03-01", &bots).unwrap();
+        let acc = scan_file(&file, "2026-03-01", &bots, "example.com").unwrap();
         let (day, visitors) = acc.into_results(NaiveDate::from_ymd_opt(2026, 3, 1).unwrap());
 
         assert_eq!(day.hits, 3); // 3 GET 200/304
@@ -880,6 +889,7 @@ mod tests {
                     "GET",
                     "/",
                     "200",
+                    "-",
                     "Mozilla/5.0",
                 ),
                 (
@@ -889,6 +899,7 @@ mod tests {
                     "GET",
                     "/articles/rust",
                     "200",
+                    "-",
                     "Mozilla/5.0 (compatible; Googlebot/2.1)",
                 ),
                 (
@@ -898,6 +909,7 @@ mod tests {
                     "GET",
                     "/about",
                     "200",
+                    "-",
                     "Mozilla/5.0 (compatible; bingbot/2.0)",
                 ),
                 // Bot doing a POST — counted in bot_activity but not in hits
@@ -908,13 +920,14 @@ mod tests {
                     "POST",
                     "/submit",
                     "200",
+                    "-",
                     "Mozilla/5.0 (compatible; Googlebot/2.1)",
                 ),
             ],
         );
 
         let bots = test_bot_map();
-        let acc = scan_file(&file, "2026-03-01", &bots).unwrap();
+        let acc = scan_file(&file, "2026-03-01", &bots, "example.com").unwrap();
         let (day, visitors) = acc.into_results(NaiveDate::from_ymd_opt(2026, 3, 1).unwrap());
 
         assert_eq!(day.hits, 3);
@@ -952,6 +965,7 @@ mod tests {
                     "GET",
                     "/",
                     "200",
+                    "-",
                     "Mozilla/5.0",
                 ),
                 (
@@ -961,6 +975,7 @@ mod tests {
                     "GET",
                     "/",
                     "200",
+                    "-",
                     "Mozilla/5.0",
                 ),
                 (
@@ -970,6 +985,7 @@ mod tests {
                     "GET",
                     "/",
                     "200",
+                    "-",
                     "Mozilla/5.0",
                 ),
                 (
@@ -979,13 +995,14 @@ mod tests {
                     "GET",
                     "/",
                     "200",
+                    "-",
                     "Mozilla/5.0",
                 ),
             ],
         );
 
         let bots = test_bot_map();
-        let acc = scan_file(&file, "2026-03-01", &bots).unwrap();
+        let acc = scan_file(&file, "2026-03-01", &bots, "example.com").unwrap();
         let (day, _) = acc.into_results(NaiveDate::from_ymd_opt(2026, 3, 1).unwrap());
 
         assert_eq!(day.hourly[9].hits, 2); // hour 09
@@ -1009,6 +1026,7 @@ mod tests {
                     "GET",
                     "/articles/rust-tips",
                     "200",
+                    "-",
                     "Mozilla/5.0",
                 ),
                 (
@@ -1018,6 +1036,7 @@ mod tests {
                     "GET",
                     "/articles/rust-tips",
                     "200",
+                    "-",
                     "Mozilla/5.0",
                 ),
                 (
@@ -1027,6 +1046,7 @@ mod tests {
                     "GET",
                     "/static/css/main.css",
                     "200",
+                    "-",
                     "Mozilla/5.0",
                 ),
                 (
@@ -1036,6 +1056,7 @@ mod tests {
                     "GET",
                     "/static/css/code.css",
                     "200",
+                    "-",
                     "Mozilla/5.0",
                 ),
                 (
@@ -1045,6 +1066,7 @@ mod tests {
                     "GET",
                     "/about",
                     "200",
+                    "-",
                     "Mozilla/5.0",
                 ),
                 (
@@ -1054,13 +1076,14 @@ mod tests {
                     "GET",
                     "/robots.txt",
                     "200",
+                    "-",
                     "Mozilla/5.0",
                 ),
             ],
         );
 
         let bots = test_bot_map();
-        let acc = scan_file(&file, "2026-03-01", &bots).unwrap();
+        let acc = scan_file(&file, "2026-03-01", &bots, "example.com").unwrap();
         let (day, _) = acc.into_results(NaiveDate::from_ymd_opt(2026, 3, 1).unwrap());
 
         let find_page = |cat: &str, path: &str| -> Option<&PageHits> {
@@ -1105,6 +1128,7 @@ mod tests {
                     "GET",
                     "/",
                     "200",
+                    "-",
                     "Mozilla/5.0",
                 ),
                 (
@@ -1114,6 +1138,7 @@ mod tests {
                     "GET",
                     "/about",
                     "200",
+                    "-",
                     "Mozilla/5.0",
                 ),
             ],
@@ -1131,6 +1156,7 @@ mod tests {
                     "GET",
                     "/",
                     "200",
+                    "-",
                     "Mozilla/5.0 (compatible; Googlebot/2.1)",
                 ),
                 // Same IP as file 1 — should not double-count visitors
@@ -1141,13 +1167,14 @@ mod tests {
                     "GET",
                     "/contact",
                     "200",
+                    "-",
                     "Mozilla/5.0",
                 ),
             ],
         );
 
-        let mut acc1 = scan_file(&f1, "2026-03-01", &bots).unwrap();
-        let acc2 = scan_file(&f2, "2026-03-01", &bots).unwrap();
+        let mut acc1 = scan_file(&f1, "2026-03-01", &bots, "example.com").unwrap();
+        let acc2 = scan_file(&f2, "2026-03-01", &bots, "example.com").unwrap();
         acc1.merge(acc2);
         let (day, visitors) = acc1.into_results(date);
 
@@ -1172,6 +1199,7 @@ mod tests {
                 "GET",
                 "/",
                 "200",
+                "-",
                 "Mozilla/5.0",
             )],
         );
@@ -1184,6 +1212,7 @@ mod tests {
                 "GET",
                 "/",
                 "200",
+                "-",
                 "Mozilla/5.0",
             )],
         );
@@ -1196,6 +1225,7 @@ mod tests {
                 "GET",
                 "/",
                 "200",
+                "-",
                 "Mozilla/5.0",
             )],
         );
@@ -1229,6 +1259,7 @@ mod tests {
                     "GET",
                     "/",
                     "200",
+                    "-",
                     "Mozilla/5.0",
                 ),
                 (
@@ -1238,6 +1269,7 @@ mod tests {
                     "GET",
                     "/about",
                     "200",
+                    "-",
                     "Mozilla/5.0",
                 ),
             ],
@@ -1251,6 +1283,7 @@ mod tests {
                 "GET",
                 "/",
                 "200",
+                "-",
                 "Mozilla/5.0",
             )],
         );
@@ -1265,6 +1298,7 @@ mod tests {
                 "GET",
                 "/",
                 "200",
+                "-",
                 "Mozilla/5.0 (compatible; Googlebot/2.1)",
             )],
         );
@@ -1274,7 +1308,7 @@ mod tests {
             NaiveDate::from_ymd_opt(2026, 3, 1).unwrap(),
             NaiveDate::from_ymd_opt(2026, 3, 2).unwrap(),
         ];
-        let results = engine.query_days(&dates, &bots).unwrap();
+        let results = engine.query_days(&dates, &bots, "example.com").unwrap();
 
         assert_eq!(results.len(), 2);
 
@@ -1294,13 +1328,111 @@ mod tests {
     }
 
     #[test]
+    fn test_external_referer_extraction() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("2026-03-01_0.parquet");
+        write_test_parquet(
+            &file,
+            &[
+                // External referer — should be counted
+                (
+                    "2026-03-01",
+                    "10:00:00",
+                    "1.1.1.1",
+                    "GET",
+                    "/",
+                    "200",
+                    "https://www.google.com/search?q=test",
+                    "Mozilla/5.0",
+                ),
+                // Same external referer — should increment count
+                (
+                    "2026-03-01",
+                    "10:01:00",
+                    "1.1.1.2",
+                    "GET",
+                    "/about",
+                    "200",
+                    "https://www.google.com/search?q=test",
+                    "Mozilla/5.0",
+                ),
+                // Different external referer
+                (
+                    "2026-03-01",
+                    "10:02:00",
+                    "1.1.1.3",
+                    "GET",
+                    "/",
+                    "200",
+                    "https://news.ycombinator.com/item?id=123",
+                    "Mozilla/5.0",
+                ),
+                // Internal referer — should be filtered out
+                (
+                    "2026-03-01",
+                    "10:03:00",
+                    "1.1.1.4",
+                    "GET",
+                    "/about",
+                    "200",
+                    "https://dev.l1x.be/articles/rust",
+                    "Mozilla/5.0",
+                ),
+                // No referer ("-") — should be filtered out
+                (
+                    "2026-03-01",
+                    "10:04:00",
+                    "1.1.1.5",
+                    "GET",
+                    "/",
+                    "200",
+                    "-",
+                    "Mozilla/5.0",
+                ),
+                // Empty referer — should be filtered out
+                (
+                    "2026-03-01",
+                    "10:05:00",
+                    "1.1.1.6",
+                    "GET",
+                    "/",
+                    "200",
+                    "",
+                    "Mozilla/5.0",
+                ),
+            ],
+        );
+
+        let bots = test_bot_map();
+        let acc = scan_file(&file, "2026-03-01", &bots, "dev.l1x.be").unwrap();
+        let (day, _) = acc.into_results(NaiveDate::from_ymd_opt(2026, 3, 1).unwrap());
+
+        // Should have 2 unique external referers
+        assert_eq!(day.referer_stats.len(), 2);
+
+        // Google referer should have 2 hits (top)
+        assert_eq!(
+            day.referer_stats[0].referer,
+            "https://www.google.com/search?q=test"
+        );
+        assert_eq!(day.referer_stats[0].hits, 2);
+
+        // HN referer should have 1 hit
+        assert_eq!(
+            day.referer_stats[1].referer,
+            "https://news.ycombinator.com/item?id=123"
+        );
+        assert_eq!(day.referer_stats[1].hits, 1);
+    }
+
+    #[test]
     fn test_query_days_empty() {
         let dir = TempDir::new().unwrap();
         let bots = test_bot_map();
         let engine = QueryEngine::new_local(dir.path()).unwrap();
 
         let dates = vec![NaiveDate::from_ymd_opt(2026, 3, 1).unwrap()];
-        let results = engine.query_days(&dates, &bots).unwrap();
+        let results = engine.query_days(&dates, &bots, "example.com").unwrap();
 
         assert_eq!(results.len(), 1);
         let (day, visitors) = &results[0];
