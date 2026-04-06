@@ -2,6 +2,9 @@
 name = "edgeview"
 version = "0.2.0"
 edition = "2021"
+description = "CloudFront log analytics with SVG/HTML reports"
+license = "MIT"
+repository = "https://github.com/vectorian-rs/edgeview"
 
 [dependencies]
 # Data analysis

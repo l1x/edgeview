@@ -10,3 +10,5 @@ reports/
 Cargo.lock.bk
 # mise
 .mise.local.toml
+.beads/
+.agent-prompts/
