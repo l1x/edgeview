@@ -1,6 +1,6 @@
 [package]
 name = "edgeview"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
 [dependencies]
@@ -47,6 +47,6 @@ quick-xml = { version = "0.31", features = ["serialize"] }
 anyhow = "1.0"
 url = "2.5"
 bytes = "1"
+tempfile = "3.8"
 
 [dev-dependencies]
-tempfile = "3.8"

@@ -27,7 +27,7 @@ fn narrow_schema() -> Schema {
 const MAX_BUCKET_BYTES: usize = 256 * 1024 * 1024;
 
 /// Maximum concurrent S3 file downloads (each file makes ~3 range requests).
-const S3_CONCURRENCY: usize = 16;
+pub(crate) const S3_CONCURRENCY: usize = 16;
 
 /// Narrow column indices in 39-column CloudFront parquet schema:
 /// 1=date, 2=time, 5=c_ip, 6=cs_method, 8=cs_uri_stem, 9=sc_status, 10=cs_Referer, 11=cs_User_Agent
@@ -39,11 +39,11 @@ const NARROW_INDICES: [usize; 8] = [1, 2, 5, 6, 8, 9, 10, 11];
 /// The parquet crate calls `get_bytes` / `get_byte_ranges` only for the
 /// column chunks selected by the projection mask — so we download ~18%
 /// of the file (7 of 39 columns) instead of the whole thing.
-struct S3ParquetReader {
-    client: aws_sdk_s3::Client,
-    bucket: String,
-    key: String,
-    size: u64,
+pub(crate) struct S3ParquetReader {
+    pub(crate) client: aws_sdk_s3::Client,
+    pub(crate) bucket: String,
+    pub(crate) key: String,
+    pub(crate) size: u64,
 }
 
 /// Timeout for a single S3 range-read request (send + body collect).
@@ -141,7 +141,7 @@ impl parquet::arrow::async_reader::AsyncFileReader for S3ParquetReader {
 // --- S3 helpers ---
 
 /// List all objects under an S3 prefix, handling pagination.
-async fn list_s3_objects(
+pub(crate) async fn list_s3_objects(
     client: &aws_sdk_s3::Client,
     bucket: &str,
     prefix: &str,

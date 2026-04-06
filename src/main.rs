@@ -1,4 +1,5 @@
 mod classify;
+mod compact;
 mod config;
 mod html;
 mod model;
@@ -17,6 +18,25 @@ struct Args {
     #[argh(option, short = 'c')]
     config: Option<PathBuf>,
 
+    /// print version and exit
+    #[argh(switch, short = 'v')]
+    version: bool,
+
+    #[argh(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(argh::FromArgs)]
+#[argh(subcommand)]
+enum Command {
+    Report(ReportArgs),
+    Compact(CompactArgs),
+}
+
+/// generate SVG/HTML reports from CloudFront logs
+#[derive(argh::FromArgs)]
+#[argh(subcommand, name = "report")]
+struct ReportArgs {
     /// month to process (YYYY-MM)
     #[argh(option, short = 'm')]
     month: Option<String>,
@@ -34,6 +54,31 @@ struct Args {
     site: Option<String>,
 }
 
+/// compact raw S3 parquet files into sorted daily files
+#[derive(argh::FromArgs)]
+#[argh(subcommand, name = "compact")]
+struct CompactArgs {
+    /// month to compact (YYYY-MM)
+    #[argh(option, short = 'm')]
+    month: Option<String>,
+
+    /// year to compact (YYYY)
+    #[argh(option, short = 'y')]
+    year: Option<String>,
+
+    /// only process this site domain
+    #[argh(option, short = 's')]
+    site: Option<String>,
+
+    /// show what would be done without writing
+    #[argh(switch)]
+    dry_run: bool,
+
+    /// force re-compact even if compact file exists
+    #[argh(switch)]
+    force: bool,
+}
+
 #[tokio::main]
 async fn main() {
     use tracing_subscriber::EnvFilter;
@@ -41,19 +86,22 @@ async fn main() {
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("edgeview=info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
-    if let Err(e) = run().await {
+    let args: Args = argh::from_env();
+    if args.version {
+        println!("edgeview {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
+
+    if let Err(e) = run(args).await {
         error!("{e:#}");
         std::process::exit(1);
     }
 }
 
-async fn run() -> anyhow::Result<()> {
-    info!("Starting up");
-
-    let args: Args = argh::from_env();
-    if args.month.is_none() && args.year.is_none() {
-        anyhow::bail!("At least one of --month or --year is required");
-    }
+async fn run(args: Args) -> anyhow::Result<()> {
+    let command = args.command.ok_or_else(|| {
+        anyhow::anyhow!("No command specified. Use `edgeview report` or `edgeview compact`.")
+    })?;
 
     let config_path = args
         .config
@@ -66,7 +114,17 @@ async fn run() -> anyhow::Result<()> {
     }
     let config = config::Config::load(&config_path)?;
 
-    let sites: Vec<&config::SiteConfig> = if let Some(ref filter) = args.site {
+    match command {
+        Command::Report(cmd) => run_report(cmd, &config).await,
+        Command::Compact(cmd) => run_compact(cmd, &config).await,
+    }
+}
+
+fn filter_sites<'a>(
+    config: &'a config::Config,
+    site_filter: &Option<String>,
+) -> anyhow::Result<Vec<&'a config::SiteConfig>> {
+    if let Some(ref filter) = site_filter {
         let matched: Vec<_> = config
             .sites
             .iter()
@@ -80,12 +138,16 @@ async fn run() -> anyhow::Result<()> {
                 available.join(", ")
             );
         }
-        matched
+        Ok(matched)
     } else {
-        config.sites.iter().collect()
-    };
+        Ok(config.sites.iter().collect())
+    }
+}
 
-    // AWS setup
+async fn make_s3_client(
+    config: &config::Config,
+    sites: &[&config::SiteConfig],
+) -> anyhow::Result<aws_sdk_s3::Client> {
     let aws_config = aws_config::load_from_env().await;
 
     let s3_region = aws_config
@@ -99,63 +161,108 @@ async fn run() -> anyhow::Result<()> {
         .build();
     let s3_client = aws_sdk_s3::Client::from_conf(s3_config);
 
-    // Validate credentials by listing a single object from the first site's prefix
+    // Validate credentials
     let s3_url = url::Url::parse(&sites[0].s3_path)
         .map_err(|e| anyhow::anyhow!("Invalid s3_path '{}': {}", sites[0].s3_path, e))?;
     let bucket = s3_url.host_str().unwrap();
     let prefix = s3_url.path().trim_start_matches('/');
-    if let Err(e) = s3_client
+    s3_client
         .list_objects_v2()
         .bucket(bucket)
         .prefix(prefix)
         .max_keys(1)
         .send()
         .await
-    {
-        error!("AWS credentials not working: {e:?}\n\n  aws sso login --profile $AWS_PROFILE");
-        std::process::exit(1);
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "AWS credentials not working: {e:?}\n\n  aws sso login --profile $AWS_PROFILE"
+            )
+        })?;
+
+    Ok(s3_client)
+}
+
+async fn run_report(cmd: ReportArgs, config: &config::Config) -> anyhow::Result<()> {
+    if cmd.month.is_none() && cmd.year.is_none() {
+        anyhow::bail!("At least one of --month or --year is required");
     }
 
+    let sites = filter_sites(config, &cmd.site)?;
+    let s3_client = make_s3_client(config, &sites).await?;
     let mut timings = pipeline::Timings::new();
     let all_domains: Vec<String> = sites.iter().map(|s| s.domain.clone()).collect();
 
+    info!("Starting report generation");
+
     for site in sites {
-        if let Some(year) = &args.year {
-            if let Err(e) = pipeline::process_site_year(
+        if let Some(year) = &cmd.year {
+            pipeline::process_site_year(
                 &s3_client,
                 site,
                 year,
-                args.no_cache,
+                cmd.no_cache,
                 &config.bots,
                 &config.output_dir,
                 &mut timings,
                 &all_domains,
             )
             .await
-            {
-                return Err(e.context(format!(
-                    "Failed to process site {} for year {}",
+            .map_err(|e| {
+                e.context(format!(
+                    "Failed to process {} for year {}",
                     site.domain, year
-                )));
-            }
+                ))
+            })?;
         }
 
-        if let Some(month) = &args.month {
-            if let Err(e) = pipeline::process_site(
+        if let Some(month) = &cmd.month {
+            pipeline::process_site(
                 &s3_client,
                 site,
                 month,
-                args.no_cache,
+                cmd.no_cache,
                 &config.bots,
                 &config.output_dir,
                 &mut timings,
                 &all_domains,
             )
             .await
-            {
-                return Err(e.context(format!("Failed to process site {}", site.domain)));
-            }
+            .map_err(|e| e.context(format!("Failed to process {}", site.domain)))?;
         }
+    }
+
+    timings.print_summary();
+    Ok(())
+}
+
+async fn run_compact(cmd: CompactArgs, config: &config::Config) -> anyhow::Result<()> {
+    if cmd.month.is_none() && cmd.year.is_none() {
+        anyhow::bail!("At least one of --month or --year is required");
+    }
+
+    let sites = filter_sites(config, &cmd.site)?;
+    let s3_client = make_s3_client(config, &sites).await?;
+    let mut timings = pipeline::Timings::new();
+
+    let compact_config = compact::CompactConfig {
+        dry_run: cmd.dry_run,
+        force: cmd.force,
+    };
+
+    info!("Starting compaction");
+
+    for site in sites {
+        let dates = if let Some(year) = &cmd.year {
+            compact::dates_in_year(year)?
+        } else if let Some(month) = &cmd.month {
+            compact::dates_in_month(month)?
+        } else {
+            unreachable!()
+        };
+
+        compact::compact_site(&s3_client, site, dates, &compact_config, &mut timings)
+            .await
+            .map_err(|e| e.context(format!("Compaction failed for {}", site.domain)))?;
     }
 
     timings.print_summary();

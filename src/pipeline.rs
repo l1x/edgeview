@@ -125,18 +125,22 @@ fn dates_in_month(month: &str) -> anyhow::Result<Vec<NaiveDate>> {
     Ok(dates)
 }
 
-/// Check if local parquet files exist for a given date.
-fn has_local_parquet(raw_dir: &Path, date: NaiveDate) -> bool {
-    let prefix = format!("{}_", date);
+/// Scan the directory once and return all dates that have local parquet files.
+fn cached_parquet_dates(raw_dir: &Path) -> std::collections::HashSet<NaiveDate> {
     std::fs::read_dir(raw_dir)
         .into_iter()
         .flatten()
         .filter_map(|e| e.ok())
-        .any(|e| {
+        .filter_map(|e| {
             let name = e.file_name();
             let name = name.to_string_lossy();
-            name.starts_with(prefix.as_str()) && name.ends_with(".parquet")
+            if !name.ends_with(".parquet") {
+                return None;
+            }
+            // Filenames are "YYYY-MM-DD_N.parquet"
+            name.split('_').next()?.parse::<NaiveDate>().ok()
         })
+        .collect()
 }
 
 /// Delete local parquet files for a given date.
@@ -392,9 +396,11 @@ async fn sync_and_query_month(
 
     // Today's data is still being written — always re-fetch.
     // With --no-cache, re-fetch everything.
+    let mut cached = cached_parquet_dates(&raw_dir);
     for &date in &all_dates {
         if date == today || no_cache {
             delete_local_parquet(&raw_dir, date);
+            cached.remove(&date);
         }
     }
 
@@ -402,7 +408,7 @@ async fn sync_and_query_month(
     let dates_to_sync: Vec<NaiveDate> = all_dates
         .iter()
         .copied()
-        .filter(|&date| !has_local_parquet(&raw_dir, date))
+        .filter(|date| !cached.contains(date))
         .collect();
 
     info!(
@@ -425,11 +431,10 @@ async fn sync_and_query_month(
     let t = Instant::now();
     let engine = QueryEngine::new_local(&raw_dir)?;
     let bots_owned = bots.clone();
-    let all_dates_owned = all_dates.clone();
     let domain_owned = site.domain.clone();
 
     let results = tokio::task::spawn_blocking(move || {
-        engine.query_days(&all_dates_owned, &bots_owned, &domain_owned)
+        engine.query_days(&all_dates, &bots_owned, &domain_owned)
     })
     .await??;
     let label = format!("Parquet scan {}", month);
