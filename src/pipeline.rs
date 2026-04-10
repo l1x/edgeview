@@ -1,15 +1,13 @@
 use crate::config::SiteConfig;
-use crate::model::{
-    human_bot_pct, last_day_of_month, DayCache, Kpi, MonthReport, YearReport, TOP_PAGES_LIMIT,
-};
+use crate::model::{human_bot_pct, last_day_of_month, DayCache, Kpi, MonthReport, YearReport};
 use crate::query::QueryEngine;
 use crate::svg::theme::GREY_ORANGE;
 use crate::svg::SvgDoc;
-use chrono::{Datelike, NaiveDate, Utc};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
+use time::{Date, Month, OffsetDateTime};
 use tracing::{info, warn};
 
 /// Collects wall-clock timing measurements for a summary table.
@@ -102,31 +100,8 @@ impl Timings {
     }
 }
 
-/// All dates in a month up to today.
-fn dates_in_month(month: &str) -> anyhow::Result<Vec<NaiveDate>> {
-    let parts: Vec<&str> = month.split('-').collect();
-    if parts.len() != 2 {
-        anyhow::bail!("Invalid month format '{}', expected YYYY-MM", month);
-    }
-    let year: i32 = parts[0].parse()?;
-    let month_num: u32 = parts[1].parse()?;
-    let first_day = NaiveDate::from_ymd_opt(year, month_num, 1)
-        .ok_or_else(|| anyhow::anyhow!("Invalid month: {}", month))?;
-    let last = last_day_of_month(year, month_num);
-    let today = Utc::now().date_naive();
-    let end_date = if last < today { last } else { today };
-
-    let mut dates = Vec::new();
-    let mut date = first_day;
-    while date <= end_date {
-        dates.push(date);
-        date = date.succ_opt().unwrap();
-    }
-    Ok(dates)
-}
-
 /// Scan the directory once and return all dates that have local parquet files.
-fn cached_parquet_dates(raw_dir: &Path) -> std::collections::HashSet<NaiveDate> {
+fn cached_parquet_dates(raw_dir: &Path) -> std::collections::HashSet<Date> {
     std::fs::read_dir(raw_dir)
         .into_iter()
         .flatten()
@@ -138,13 +113,13 @@ fn cached_parquet_dates(raw_dir: &Path) -> std::collections::HashSet<NaiveDate> 
                 return None;
             }
             // Filenames are "YYYY-MM-DD_N.parquet"
-            name.split('_').next()?.parse::<NaiveDate>().ok()
+            crate::model::parse_date(name.split('_').next()?)
         })
         .collect()
 }
 
 /// Delete local parquet files for a given date.
-fn delete_local_parquet(raw_dir: &Path, date: NaiveDate) {
+fn delete_local_parquet(raw_dir: &Path, date: Date) {
     let prefix = format!("{}_", date);
     if let Ok(entries) = std::fs::read_dir(raw_dir) {
         for entry in entries.filter_map(|e| e.ok()) {
@@ -160,7 +135,7 @@ fn delete_local_parquet(raw_dir: &Path, date: NaiveDate) {
 /// Write visitor IPs to a Parquet file: columns (date Utf8, c_ip Utf8, is_bot Boolean).
 fn write_visitor_parquet(
     path: &std::path::Path,
-    date: &NaiveDate,
+    date: &Date,
     visitors: &[(String, bool)],
 ) -> anyhow::Result<()> {
     use arrow::array::{BooleanArray, RecordBatch, StringArray};
@@ -208,8 +183,8 @@ fn write_visitor_parquet(
 /// Returns (total_unique_visitors, bot_unique_visitors).
 async fn count_unique_visitors(
     visitor_dir: &std::path::Path,
-    date_from: NaiveDate,
-    date_to: NaiveDate,
+    date_from: Date,
+    date_to: Date,
 ) -> anyhow::Result<(u64, u64)> {
     let visitor_dir = visitor_dir.to_path_buf();
     tokio::task::spawn_blocking(move || {
@@ -220,8 +195,8 @@ async fn count_unique_visitors(
 
 fn count_unique_visitors_sync(
     visitor_dir: &std::path::Path,
-    date_from: NaiveDate,
-    date_to: NaiveDate,
+    date_from: Date,
+    date_to: Date,
 ) -> anyhow::Result<(u64, u64)> {
     use arrow::array::{BooleanArray, StringArray};
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -240,8 +215,7 @@ fn count_unique_visitors_sync(
                 return false;
             }
             let date_str = &name[..name.len() - 8];
-            date_str
-                .parse::<NaiveDate>()
+            crate::model::parse_date(date_str)
                 .map(|d| d >= date_from && d <= date_to)
                 .unwrap_or(false)
         })
@@ -323,19 +297,7 @@ fn build_month_svg(
     report: &MonthReport,
     missing_urls: &[String],
 ) -> String {
-    let content_pages: Vec<_> = report
-        .top_pages
-        .iter()
-        .filter(|p| p.category == "page")
-        .take(TOP_PAGES_LIMIT)
-        .cloned()
-        .collect();
-    let static_assets: Vec<_> = report
-        .top_pages
-        .iter()
-        .filter(|p| p.category != "page")
-        .cloned()
-        .collect();
+    let (content_pages, static_assets) = crate::model::split_pages(&report.top_pages);
 
     let mut doc = SvgDoc::new(800.0, GREY_ORANGE);
     doc.add_section_title(&format!("{} / {}", site.domain, month));
@@ -380,15 +342,15 @@ async fn sync_and_query_month(
     s3_client: &aws_sdk_s3::Client,
     site: &SiteConfig,
     month: &str,
-    bots: &HashMap<String, String>,
+    bots: &[(String, String)],
     cache_dir: &Path,
     no_cache: bool,
     timings: &mut Timings,
 ) -> anyhow::Result<Vec<DayCache>> {
     let raw_dir = cache_dir.join("raw");
     let visitor_dir = cache_dir.join("visitors");
-    let today = Utc::now().date_naive();
-    let all_dates = dates_in_month(month)?;
+    let today = OffsetDateTime::now_utc().date();
+    let all_dates = crate::model::dates_in_month(month)?;
 
     if all_dates.is_empty() {
         return Ok(Vec::new());
@@ -405,7 +367,7 @@ async fn sync_and_query_month(
     }
 
     // Sync dates that have no local parquet
-    let dates_to_sync: Vec<NaiveDate> = all_dates
+    let dates_to_sync: Vec<Date> = all_dates
         .iter()
         .copied()
         .filter(|date| !cached.contains(date))
@@ -430,7 +392,7 @@ async fn sync_and_query_month(
     // Scan all dates from local parquet
     let t = Instant::now();
     let engine = QueryEngine::new_local(&raw_dir)?;
-    let bots_owned = bots.clone();
+    let bots_owned = bots.to_vec();
     let domain_owned = site.domain.clone();
 
     let results = tokio::task::spawn_blocking(move || {
@@ -442,7 +404,7 @@ async fn sync_and_query_month(
 
     // Write visitor parquet only for newly synced dates
     let t = Instant::now();
-    let synced: std::collections::HashSet<NaiveDate> = dates_to_sync.into_iter().collect();
+    let synced: std::collections::HashSet<Date> = dates_to_sync.into_iter().collect();
     let mut all_days: Vec<DayCache> = Vec::new();
     for (day_cache, visitor_ips) in results {
         if synced.contains(&day_cache.date) {
@@ -457,6 +419,7 @@ async fn sync_and_query_month(
     Ok(all_days)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn process_site(
     s3_client: &aws_sdk_s3::Client,
     site: &SiteConfig,
@@ -469,20 +432,21 @@ pub async fn process_site(
 ) -> anyhow::Result<()> {
     let cache_dir = PathBuf::from(".edgeview_cache").join(&site.domain);
     std::fs::create_dir_all(&cache_dir)?;
+    let bots_vec: Vec<(String, String)> =
+        bots.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
 
-    let all_days =
-        sync_and_query_month(s3_client, site, month, bots, &cache_dir, no_cache, timings).await?;
+    let all_days = sync_and_query_month(
+        s3_client, site, month, &bots_vec, &cache_dir, no_cache, timings,
+    )
+    .await?;
 
     // Compute exact visitor counts from Parquet
     let t = Instant::now();
     let visitor_dir = cache_dir.join("visitors");
-    let parts: Vec<&str> = month.split('-').collect();
-    let year: i32 = parts[0].parse()?;
-    let month_num: u32 = parts[1].parse()?;
-    let first_day = NaiveDate::from_ymd_opt(year, month_num, 1).unwrap();
+    let (year, month_num, first_day) = crate::model::parse_month(month)?;
     let last = last_day_of_month(year, month_num);
-    let today = Utc::now().date_naive();
-    let end_date = if last < today { last } else { today };
+    let today = OffsetDateTime::now_utc().date();
+    let end_date = last.min(today);
 
     let exact_visitors = if visitor_dir.exists() {
         let (v, bv) = count_unique_visitors(&visitor_dir, first_day, end_date).await?;
@@ -553,20 +517,7 @@ fn build_year_svg(domain: &str, year: &str, year_report: &YearReport) -> String 
 
     doc.add_monthly_traffic_section(&year_report.monthly);
 
-    let content_pages: Vec<_> = year_report
-        .top_pages
-        .iter()
-        .filter(|p| p.category == "page")
-        .take(TOP_PAGES_LIMIT)
-        .cloned()
-        .collect();
-    let static_assets: Vec<_> = year_report
-        .top_pages
-        .iter()
-        .filter(|p| p.category != "page")
-        .cloned()
-        .collect();
-
+    let (content_pages, static_assets) = crate::model::split_pages(&year_report.top_pages);
     doc.add_top_content_pages(&content_pages);
     doc.add_static_assets(&static_assets);
     doc.add_bot_activity_section(&year_report.bot_stats);
@@ -576,8 +527,6 @@ fn build_year_svg(domain: &str, year: &str, year_report: &YearReport) -> String 
 
 /// Build the MonthHtmlData for the year HTML dashboard from a MonthReport.
 fn build_month_html_data(month_str: &str, report: &MonthReport) -> crate::html::MonthHtmlData {
-    let summary = crate::model::MonthSummary::from_month_report(report, month_str);
-
     let mut dates: Vec<&String> = report.daily_pages.keys().collect();
     dates.sort();
     let day_data: Vec<crate::html::DayHtmlData> = dates
@@ -596,15 +545,20 @@ fn build_month_html_data(month_str: &str, report: &MonthReport) -> crate::html::
                 bot_hits: pages.iter().map(|p| p.bot_hits).sum(),
                 pages,
                 hourly,
-                bot_stats: report.bot_stats.clone(),
-                referer_stats: Vec::new(),
             }
         })
         .collect();
 
     crate::html::MonthHtmlData {
         month: month_str.to_string(),
-        summary,
+        total_hits: report.total_hits,
+        total_visitors: report.total_visitors,
+        total_bot_hits: report.total_bot_hits,
+        total_bot_visitors: report.total_bot_visitors,
+        daily: report.daily.clone(),
+        top_pages: report.top_pages.clone(),
+        bot_stats: report.bot_stats.clone(),
+        referer_stats: report.referer_stats.clone(),
         days: day_data,
     }
 }
@@ -634,6 +588,7 @@ fn discover_available_years(output_dir: &Path, domain: &str, current_year: i32) 
     years.into_iter().collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn process_site_year(
     s3_client: &aws_sdk_s3::Client,
     site: &SiteConfig,
@@ -646,11 +601,13 @@ pub async fn process_site_year(
 ) -> anyhow::Result<()> {
     let cache_dir = PathBuf::from(".edgeview_cache").join(&site.domain);
     std::fs::create_dir_all(&cache_dir)?;
+    let bots_vec: Vec<(String, String)> =
+        bots.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
 
     let year_num: i32 = year.parse()?;
-    let today = Utc::now().date_naive();
-    let max_month = if year_num == today.year() {
-        today.month()
+    let today = OffsetDateTime::now_utc().date();
+    let max_month: u32 = if year_num == today.year() {
+        u8::from(today.month()) as u32
     } else {
         12
     };
@@ -664,7 +621,7 @@ pub async fn process_site_year(
     for m in 1..=max_month {
         let month_str = format!("{}-{:02}", year, m);
         let all_days = sync_and_query_month(
-            s3_client, site, &month_str, bots, &cache_dir, no_cache, timings,
+            s3_client, site, &month_str, &bots_vec, &cache_dir, no_cache, timings,
         )
         .await?;
 
@@ -675,9 +632,9 @@ pub async fn process_site_year(
 
         // Compute exact visitors for this month from Parquet
         let t = Instant::now();
-        let first_day = NaiveDate::from_ymd_opt(year_num, m, 1).unwrap();
+        let first_day = Date::from_calendar_date(year_num, Month::try_from(m as u8)?, 1)?;
         let last = last_day_of_month(year_num, m);
-        let end_date = if last < today { last } else { today };
+        let end_date = last.min(today);
 
         let exact_visitors = if visitor_dir.exists() {
             let (v, bv) = count_unique_visitors(&visitor_dir, first_day, end_date).await?;
@@ -726,9 +683,9 @@ pub async fn process_site_year(
 
     // Compute exact year-level visitors from Parquet
     let t = Instant::now();
-    let first_day = NaiveDate::from_ymd_opt(year_num, 1, 1).unwrap();
-    let last_day = NaiveDate::from_ymd_opt(year_num, 12, 31).unwrap();
-    let end_date = if last_day < today { last_day } else { today };
+    let first_day = Date::from_calendar_date(year_num, Month::January, 1)?;
+    let last_day = Date::from_calendar_date(year_num, Month::December, 31)?;
+    let end_date = last_day.min(today);
 
     let (year_visitors, year_bot_visitors) = if visitor_dir.exists() {
         count_unique_visitors(&visitor_dir, first_day, end_date).await?

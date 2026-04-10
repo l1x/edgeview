@@ -3,12 +3,11 @@ use crate::config::SiteConfig;
 use crate::model::*;
 use arrow::array::{Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
-use chrono::{Datelike, NaiveDate};
 use rayon::prelude::*;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use url::Url;
+use time::Date;
 
 /// The 8 narrow columns we extract from CloudFront logs.
 fn narrow_schema() -> Schema {
@@ -23,8 +22,6 @@ fn narrow_schema() -> Schema {
         Field::new("cs_User_Agent", DataType::Utf8, true),
     ])
 }
-
-const MAX_BUCKET_BYTES: usize = 256 * 1024 * 1024;
 
 /// Maximum concurrent S3 file downloads (each file makes ~3 range requests).
 pub(crate) const S3_CONCURRENCY: usize = 16;
@@ -119,6 +116,12 @@ impl parquet::arrow::async_reader::AsyncFileReader for S3ParquetReader {
     > {
         let size = self.size;
         Box::pin(async move {
+            if size < 12 {
+                return Err(parquet::errors::ParquetError::General(format!(
+                    "File too small ({} bytes) to be valid parquet",
+                    size
+                )));
+            }
             // Read last 8 bytes: footer_len (4 LE) + magic "PAR1" (4)
             let suffix = self.get_bytes((size - 8)..size).await?;
             if suffix.len() < 8 || &suffix[4..8] != b"PAR1" {
@@ -167,12 +170,12 @@ pub(crate) async fn list_s3_objects(
 }
 
 /// Sync multiple days' CloudFront logs from S3 concurrently.
-/// Uses parquet range reads to download only the 7 needed columns (~18% of data).
-/// All files across all days are processed in a single concurrent work pool.
+/// Reads from compacted daily parquet files (`<domain>/compact/YYYY/MM/DD.parquet`),
+/// using byte-range requests to download only the 8 needed columns (~18% of data).
 pub async fn sync_days_from_s3(
     client: &aws_sdk_s3::Client,
     site: &SiteConfig,
-    dates: &[NaiveDate],
+    dates: &[Date],
     raw_dir: &Path,
 ) -> anyhow::Result<()> {
     use futures::stream::{self, StreamExt, TryStreamExt};
@@ -181,84 +184,77 @@ pub async fn sync_days_from_s3(
     use parquet::basic::Compression;
     use parquet::file::properties::WriterProperties;
 
-    let s3_url = Url::parse(&site.s3_path)?;
-    let bucket_name = s3_url.host_str().unwrap_or_default().to_string();
-    let s3_prefix = s3_url.path().trim_start_matches('/').to_string();
+    let (bucket_name, s3_prefix) = site.s3_bucket_and_prefix()?;
+    let compact_prefix = crate::compact::compact_s3_prefix(&s3_prefix);
     let client = client.clone();
 
     std::fs::create_dir_all(raw_dir)?;
 
-    // 1. List all objects for all dates (throttled)
-    let day_listings: Vec<(NaiveDate, Vec<aws_sdk_s3::types::Object>)> =
-        stream::iter(dates.iter().map(|&date| {
-            let client = client.clone();
-            let bucket_name = bucket_name.clone();
-            let s3_prefix = s3_prefix.clone();
-            async move {
-                let prefix = format!(
-                    "{}/{}/{:02}/{:02}/",
-                    s3_prefix,
-                    date.year(),
-                    date.month(),
-                    date.day()
-                );
-                let objects = list_s3_objects(&client, &bucket_name, &prefix).await?;
-                Ok::<_, anyhow::Error>((date, objects))
-            }
-        }))
-        .buffer_unordered(S3_CONCURRENCY)
-        .try_collect()
-        .await?;
-
-    // 2. Build flat work list: (date, key, size, bucket_idx)
-    struct SyncItem {
-        date: NaiveDate,
+    // 1. HEAD each compact file to get size (and confirm existence)
+    struct CompactFile {
+        date: Date,
         key: String,
         size: u64,
-        bucket_idx: usize,
     }
 
-    let mut work: Vec<SyncItem> = Vec::new();
-    let mut total_remote_bytes: u64 = 0;
-
-    for (date, objects) in &day_listings {
-        if objects.is_empty() {
-            continue;
+    let heads: Vec<Option<CompactFile>> = stream::iter(dates.iter().map(|&date| {
+        let client = client.clone();
+        let bucket_name = bucket_name.clone();
+        let key = crate::compact::compact_key(&compact_prefix, date);
+        async move {
+            match client
+                .head_object()
+                .bucket(&bucket_name)
+                .key(&key)
+                .send()
+                .await
+            {
+                Ok(resp) => {
+                    let size = resp.content_length.unwrap_or(0) as u64;
+                    if size < 12 {
+                        tracing::warn!(date = %date, size, "Compact file too small, skipping");
+                        return Ok(None);
+                    }
+                    Ok::<_, anyhow::Error>(Some(CompactFile { date, key, size }))
+                }
+                Err(e) => {
+                    let svc = e.into_service_error();
+                    if svc.is_not_found() {
+                        tracing::debug!(date = %date, "No compact file, skipping");
+                        Ok(None)
+                    } else {
+                        Err(anyhow::anyhow!(
+                            "HEAD compact file failed for {}: {}",
+                            date,
+                            svc
+                        ))
+                    }
+                }
+            }
         }
-        let total_size: usize = objects.iter().map(|o| o.size.unwrap_or(0) as usize).sum();
-        let n_buckets = std::cmp::max(1, total_size.div_ceil(MAX_BUCKET_BYTES));
+    }))
+    .buffer_unordered(S3_CONCURRENCY)
+    .try_collect()
+    .await?;
 
-        for obj in objects {
-            let key = obj.key.as_deref().unwrap_or_default();
-            let filename = key.rsplit('/').next().unwrap_or(key);
-            let hash = blake3::hash(filename.as_bytes());
-            let hash_val = u64::from_le_bytes(hash.as_bytes()[..8].try_into().unwrap());
-            let bucket_idx = (hash_val as usize) % n_buckets;
-            let size = obj.size.unwrap_or(0) as u64;
-            total_remote_bytes += size;
-            work.push(SyncItem {
-                date: *date,
-                key: key.to_string(),
-                size,
-                bucket_idx,
-            });
-        }
-    }
+    let work: Vec<CompactFile> = heads.into_iter().flatten().collect();
 
     if work.is_empty() {
         return Ok(());
     }
 
+    let total_remote_bytes: u64 = work.iter().map(|f| f.size).sum();
+
     tracing::info!(
         domain = %site.domain,
         dates = dates.len(),
-        files = work.len(),
+        compact_files = work.len(),
         total_remote_bytes,
-        "Syncing from S3 with range reads (8/39 columns)"
+        "Syncing from S3 compact files with range reads (8/39 columns)"
     );
 
-    // 3. Download narrow columns concurrently across all files
-    type BatchResult = (NaiveDate, usize, Vec<arrow::array::RecordBatch>);
+    // 2. Download narrow columns from each compact file concurrently
+    type BatchResult = (Date, Vec<arrow::array::RecordBatch>);
 
     let results: Vec<BatchResult> = stream::iter(work.into_iter().map(|item| {
         let client = client.clone();
@@ -281,54 +277,37 @@ pub async fn sync_days_from_s3(
             while let Some(batch) = stream.next().await {
                 batches.push(batch?);
             }
-            Ok::<BatchResult, anyhow::Error>((item.date, item.bucket_idx, batches))
+            Ok::<BatchResult, anyhow::Error>((item.date, batches))
         }
     }))
     .buffer_unordered(S3_CONCURRENCY)
     .try_collect()
     .await?;
 
-    // 4. Group by (date, bucket_idx) and write local ZSTD-compressed parquet
-    let mut grouped: HashMap<(NaiveDate, usize), Vec<arrow::array::RecordBatch>> = HashMap::new();
-    let mut downloaded_bytes: u64 = 0;
-    for (date, bucket_idx, batches) in results {
-        for b in &batches {
-            downloaded_bytes += b.get_array_memory_size() as u64;
-        }
-        grouped
-            .entry((date, bucket_idx))
-            .or_default()
-            .extend(batches);
-    }
-
+    // 3. Write one local narrow parquet file per date
     let schema = Arc::new(narrow_schema());
     let props = WriterProperties::builder()
         .set_compression(Compression::ZSTD(Default::default()))
         .build();
 
-    for ((date, bucket_idx), batches) in &grouped {
-        let output_path = raw_dir.join(format!("{}_{}.parquet", date, bucket_idx));
+    let mut local_bytes: u64 = 0;
+    for (date, batches) in &results {
+        let output_path = raw_dir.join(format!("{}_0.parquet", date));
         let file = std::fs::File::create(&output_path)?;
         let mut writer = ArrowWriter::try_new(file, schema.clone(), Some(props.clone()))?;
         for batch in batches {
             writer.write(batch)?;
         }
         writer.close()?;
+        local_bytes += std::fs::metadata(&output_path)?.len();
     }
 
     tracing::info!(
         domain = %site.domain,
+        compact_files = results.len(),
         remote_bytes = total_remote_bytes,
-        downloaded_bytes,
-        saved_pct = format_args!(
-            "{:.0}%",
-            if total_remote_bytes > 0 {
-                (1.0 - downloaded_bytes as f64 / total_remote_bytes as f64) * 100.0
-            } else {
-                0.0
-            }
-        ),
-        "S3 sync complete"
+        local_bytes,
+        "S3 sync complete (8/39 columns via range reads)"
     );
 
     Ok(())
@@ -346,8 +325,6 @@ struct PageAccum {
 struct DayAccumulators {
     hits: u64,
     bot_hits: u64,
-    visitor_ips: HashSet<String>,
-    bot_visitor_ips: HashSet<String>,
     page_stats: HashMap<(String, String), PageAccum>,
     hourly_hits: [u64; 24],
     hourly_visitors: Vec<HashSet<String>>,
@@ -362,8 +339,6 @@ impl Default for DayAccumulators {
         Self {
             hits: 0,
             bot_hits: 0,
-            visitor_ips: HashSet::new(),
-            bot_visitor_ips: HashSet::new(),
             page_stats: HashMap::new(),
             hourly_hits: [0; 24],
             hourly_visitors: (0..24).map(|_| HashSet::new()).collect(),
@@ -379,8 +354,6 @@ impl DayAccumulators {
     fn merge(&mut self, other: Self) {
         self.hits += other.hits;
         self.bot_hits += other.bot_hits;
-        self.visitor_ips.extend(other.visitor_ips);
-        self.bot_visitor_ips.extend(other.bot_visitor_ips);
 
         for (key, other_page) in other.page_stats {
             let entry = self.page_stats.entry(key).or_default();
@@ -416,7 +389,7 @@ impl DayAccumulators {
         }
     }
 
-    fn into_results(self, date: NaiveDate) -> (DayCache, Vec<(String, bool)>) {
+    fn into_results(self, date: Date) -> (DayCache, Vec<(String, bool)>) {
         let mut top_pages: Vec<PageHits> = self
             .page_stats
             .into_iter()
@@ -438,10 +411,7 @@ impl DayAccumulators {
             })
             .collect();
 
-        let last_crawl = chrono::DateTime::from_naive_utc_and_offset(
-            date.and_hms_opt(0, 0, 0).unwrap(),
-            chrono::Utc,
-        );
+        let last_crawl = date.with_time(time::Time::MIDNIGHT).assume_utc();
         let mut bot_stats: Vec<CrawlerStats> = self
             .bot_activity
             .into_iter()
@@ -460,14 +430,16 @@ impl DayAccumulators {
             .collect();
         referer_stats.sort_by_key(|r| std::cmp::Reverse(r.hits));
 
+        let total_visitors = self.all_visitor_ips.len() as u64;
+        let bot_visitors = self.all_visitor_ips.values().filter(|&&b| b).count() as u64;
         let visitor_ips: Vec<(String, bool)> = self.all_visitor_ips.into_iter().collect();
 
         let day_cache = DayCache {
             date,
             hits: self.hits,
-            visitors: self.visitor_ips.len() as u64,
+            visitors: total_visitors,
             bot_hits: self.bot_hits,
-            bot_visitors: self.bot_visitor_ips.len() as u64,
+            bot_visitors,
             top_pages,
             hourly,
             bot_stats,
@@ -479,11 +451,28 @@ impl DayAccumulators {
     }
 }
 
+/// Downcast an arrow column to StringArray with a clear error.
+fn col_as_str(batch: &arrow::array::RecordBatch, idx: usize) -> anyhow::Result<&StringArray> {
+    batch
+        .column(idx)
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| anyhow::anyhow!("Column {} is not Utf8", batch.schema().field(idx).name()))
+}
+
+/// Extract the host from a URL string without full parsing.
+fn extract_referer_host(referer: &str) -> Option<&str> {
+    let after_scheme = referer
+        .strip_prefix("https://")
+        .or_else(|| referer.strip_prefix("http://"))?;
+    Some(after_scheme.split('/').next().unwrap_or(after_scheme))
+}
+
 /// Read one parquet file, filter by date, accumulate all metrics in a single pass.
 fn scan_file(
     path: &Path,
     target_date: &str,
-    bot_map: &HashMap<String, String>,
+    bot_map: &[(String, String)],
     site_domain: &str,
 ) -> anyhow::Result<DayAccumulators> {
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
@@ -495,46 +484,14 @@ fn scan_file(
     for batch_result in reader {
         let batch = batch_result?;
         // Columns: date(0), time(1), c_ip(2), cs_method(3), cs_uri_stem(4), sc_status(5), cs_Referer(6), cs_User_Agent(7)
-        let date_col = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        let time_col = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        let ip_col = batch
-            .column(2)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        let method_col = batch
-            .column(3)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        let path_col = batch
-            .column(4)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        let status_col = batch
-            .column(5)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        let referer_col = batch
-            .column(6)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        let ua_col = batch
-            .column(7)
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
+        let date_col = col_as_str(&batch, 0)?;
+        let time_col = col_as_str(&batch, 1)?;
+        let ip_col = col_as_str(&batch, 2)?;
+        let method_col = col_as_str(&batch, 3)?;
+        let path_col = col_as_str(&batch, 4)?;
+        let status_col = col_as_str(&batch, 5)?;
+        let referer_col = col_as_str(&batch, 6)?;
+        let ua_col = col_as_str(&batch, 7)?;
 
         for row in 0..batch.num_rows() {
             if date_col.value(row) != target_date {
@@ -570,18 +527,16 @@ fn scan_file(
             let is_bot = bot_name.is_some();
 
             acc.hits += 1;
-            acc.visitor_ips.insert(c_ip.clone());
 
             if is_bot {
                 acc.bot_hits += 1;
-                acc.bot_visitor_ips.insert(c_ip.clone());
             }
 
             // Page stats
             let (category, display_path) = classify_path(uri);
             let page = acc
                 .page_stats
-                .entry((category.to_string(), display_path))
+                .entry((category.to_string(), display_path.to_string()))
                 .or_default();
             page.hits += 1;
             page.visitor_ips.insert(c_ip.clone());
@@ -608,12 +563,8 @@ fn scan_file(
                 let referer = referer_col.value(row);
                 if referer != "-" && !referer.is_empty() {
                     // Check if it's external by comparing the host
-                    let is_external = url::Url::parse(referer)
-                        .map(|u| {
-                            u.host_str()
-                                .is_some_and(|h| !h.eq_ignore_ascii_case(site_domain))
-                        })
-                        .unwrap_or(false);
+                    let is_external = extract_referer_host(referer)
+                        .is_some_and(|h| !h.eq_ignore_ascii_case(site_domain));
                     if is_external {
                         *acc.referer_hits.entry(referer.to_string()).or_default() += 1;
                     }
@@ -645,7 +596,7 @@ impl QueryEngine {
     }
 
     /// List parquet files matching a specific date prefix.
-    fn files_for_date(&self, date: NaiveDate) -> Vec<PathBuf> {
+    fn files_for_date(&self, date: Date) -> Vec<PathBuf> {
         let prefix = format!("{}_", date);
         std::fs::read_dir(&self.raw_dir)
             .into_iter()
@@ -666,12 +617,12 @@ impl QueryEngine {
     #[allow(clippy::type_complexity)]
     pub fn query_days(
         &self,
-        dates: &[NaiveDate],
-        bot_map: &HashMap<String, String>,
+        dates: &[Date],
+        bot_map: &[(String, String)],
         site_domain: &str,
     ) -> anyhow::Result<Vec<(DayCache, Vec<(String, bool)>)>> {
         // Flatten all (date, file) pairs
-        let work_items: Vec<(NaiveDate, PathBuf)> = dates
+        let work_items: Vec<(Date, PathBuf)> = dates
             .iter()
             .flat_map(|&date| {
                 self.files_for_date(date)
@@ -694,7 +645,7 @@ impl QueryEngine {
         );
 
         // Process all files in parallel
-        let file_results: Vec<(NaiveDate, DayAccumulators)> = work_items
+        let file_results: Vec<(Date, DayAccumulators)> = work_items
             .par_iter()
             .map(|(date, file)| {
                 let acc = scan_file(file, &date.to_string(), bot_map, site_domain)?;
@@ -703,7 +654,7 @@ impl QueryEngine {
             .collect::<Result<Vec<_>, anyhow::Error>>()?;
 
         // Group by date and merge
-        let mut day_accums: HashMap<NaiveDate, DayAccumulators> = HashMap::new();
+        let mut day_accums: HashMap<Date, DayAccumulators> = HashMap::new();
         for (date, acc) in file_results {
             day_accums.entry(date).or_default().merge(acc);
         }
@@ -721,20 +672,38 @@ impl QueryEngine {
     }
 }
 
-/// Classify a URL path into a category and a display path based on file extension.
-fn classify_path(path: &str) -> (&'static str, String) {
-    let ext = path.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase());
-    match ext.as_deref() {
-        Some("css") => ("css", path.to_string()),
-        Some("js" | "mjs") => ("js", path.to_string()),
-        Some("png" | "jpg" | "jpeg" | "gif" | "webp" | "svg" | "ico" | "avif" | "bmp") => {
-            ("image", path.to_string())
+/// Classify a URL path into a category based on file extension.
+fn classify_path(path: &str) -> (&'static str, &str) {
+    let ext = path.rsplit_once('.').map(|(_, e)| e);
+    let category = match ext {
+        Some(e) if e.eq_ignore_ascii_case("css") => "css",
+        Some(e) if e.eq_ignore_ascii_case("js") || e.eq_ignore_ascii_case("mjs") => "js",
+        Some(e)
+            if [
+                "png", "jpg", "jpeg", "gif", "webp", "svg", "ico", "avif", "bmp",
+            ]
+            .iter()
+            .any(|x| e.eq_ignore_ascii_case(x)) =>
+        {
+            "image"
         }
-        Some("ttf" | "woff" | "woff2" | "eot" | "otf") => ("font", path.to_string()),
-        Some("xml" | "json" | "rss" | "atom" | "txt") => ("data", path.to_string()),
-        Some("html") | None => ("page", path.to_string()),
-        Some(_) => ("page", path.to_string()),
-    }
+        Some(e)
+            if ["ttf", "woff", "woff2", "eot", "otf"]
+                .iter()
+                .any(|x| e.eq_ignore_ascii_case(x)) =>
+        {
+            "font"
+        }
+        Some(e)
+            if ["xml", "json", "rss", "atom", "txt"]
+                .iter()
+                .any(|x| e.eq_ignore_ascii_case(x)) =>
+        {
+            "data"
+        }
+        _ => "page",
+    };
+    (category, path)
 }
 
 #[cfg(test)]
@@ -784,11 +753,11 @@ mod tests {
         writer.close().unwrap();
     }
 
-    fn test_bot_map() -> HashMap<String, String> {
-        let mut m = HashMap::new();
-        m.insert("Googlebot".to_string(), "Google".to_string());
-        m.insert("bingbot".to_string(), "Bing".to_string());
-        m
+    fn test_bot_map() -> Vec<(String, String)> {
+        vec![
+            ("Googlebot".to_string(), "Google".to_string()),
+            ("bingbot".to_string(), "Bing".to_string()),
+        ]
     }
 
     #[test]
@@ -866,7 +835,7 @@ mod tests {
 
         let bots = test_bot_map();
         let acc = scan_file(&file, "2026-03-01", &bots, "example.com").unwrap();
-        let (day, visitors) = acc.into_results(NaiveDate::from_ymd_opt(2026, 3, 1).unwrap());
+        let (day, visitors) = acc.into_results(time::macros::date!(2026 - 03 - 01));
 
         assert_eq!(day.hits, 3); // 3 GET 200/304
         assert_eq!(day.visitors, 2); // 1.2.3.4 and 1.2.3.5
@@ -928,7 +897,7 @@ mod tests {
 
         let bots = test_bot_map();
         let acc = scan_file(&file, "2026-03-01", &bots, "example.com").unwrap();
-        let (day, visitors) = acc.into_results(NaiveDate::from_ymd_opt(2026, 3, 1).unwrap());
+        let (day, visitors) = acc.into_results(time::macros::date!(2026 - 03 - 01));
 
         assert_eq!(day.hits, 3);
         assert_eq!(day.visitors, 3);
@@ -1003,7 +972,7 @@ mod tests {
 
         let bots = test_bot_map();
         let acc = scan_file(&file, "2026-03-01", &bots, "example.com").unwrap();
-        let (day, _) = acc.into_results(NaiveDate::from_ymd_opt(2026, 3, 1).unwrap());
+        let (day, _) = acc.into_results(time::macros::date!(2026 - 03 - 01));
 
         assert_eq!(day.hourly[9].hits, 2); // hour 09
         assert_eq!(day.hourly[9].visitors, 2);
@@ -1084,7 +1053,7 @@ mod tests {
 
         let bots = test_bot_map();
         let acc = scan_file(&file, "2026-03-01", &bots, "example.com").unwrap();
-        let (day, _) = acc.into_results(NaiveDate::from_ymd_opt(2026, 3, 1).unwrap());
+        let (day, _) = acc.into_results(time::macros::date!(2026 - 03 - 01));
 
         let find_page = |cat: &str, path: &str| -> Option<&PageHits> {
             day.top_pages
@@ -1113,7 +1082,7 @@ mod tests {
     #[test]
     fn test_accumulator_merge() {
         let dir = TempDir::new().unwrap();
-        let date = NaiveDate::from_ymd_opt(2026, 3, 1).unwrap();
+        let date = time::macros::date!(2026 - 03 - 01);
         let bots = test_bot_map();
 
         // File 1: human traffic
@@ -1234,9 +1203,9 @@ mod tests {
 
         let engine = QueryEngine::new_local(dir.path()).unwrap();
 
-        let mar01 = NaiveDate::from_ymd_opt(2026, 3, 1).unwrap();
-        let mar02 = NaiveDate::from_ymd_opt(2026, 3, 2).unwrap();
-        let mar03 = NaiveDate::from_ymd_opt(2026, 3, 3).unwrap();
+        let mar01 = time::macros::date!(2026 - 03 - 01);
+        let mar02 = time::macros::date!(2026 - 03 - 02);
+        let mar03 = time::macros::date!(2026 - 03 - 03);
 
         assert_eq!(engine.files_for_date(mar01).len(), 2);
         assert_eq!(engine.files_for_date(mar02).len(), 1);
@@ -1305,8 +1274,8 @@ mod tests {
 
         let engine = QueryEngine::new_local(dir.path()).unwrap();
         let dates = vec![
-            NaiveDate::from_ymd_opt(2026, 3, 1).unwrap(),
-            NaiveDate::from_ymd_opt(2026, 3, 2).unwrap(),
+            time::macros::date!(2026 - 03 - 01),
+            time::macros::date!(2026 - 03 - 02),
         ];
         let results = engine.query_days(&dates, &bots, "example.com").unwrap();
 
@@ -1405,7 +1374,7 @@ mod tests {
 
         let bots = test_bot_map();
         let acc = scan_file(&file, "2026-03-01", &bots, "dev.l1x.be").unwrap();
-        let (day, _) = acc.into_results(NaiveDate::from_ymd_opt(2026, 3, 1).unwrap());
+        let (day, _) = acc.into_results(time::macros::date!(2026 - 03 - 01));
 
         // Should have 2 unique external referers
         assert_eq!(day.referer_stats.len(), 2);
@@ -1431,7 +1400,7 @@ mod tests {
         let bots = test_bot_map();
         let engine = QueryEngine::new_local(dir.path()).unwrap();
 
-        let dates = vec![NaiveDate::from_ymd_opt(2026, 3, 1).unwrap()];
+        let dates = vec![time::macros::date!(2026 - 03 - 01)];
         let results = engine.query_days(&dates, &bots, "example.com").unwrap();
 
         assert_eq!(results.len(), 1);

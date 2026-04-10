@@ -1,5 +1,5 @@
 [tools]
-rust = "stable"
+rust = "1.91.1"
 
 [env]
 RUST_BACKTRACE = "1"

@@ -12,8 +12,7 @@ parquet = { version = "57", default-features = false, features = ["arrow", "asyn
 futures = "0.3"
 arrow = { version = "57", default-features = false }
 rayon = "1.10"
-blake3 = "1"
-chrono = { version = "0.4", features = ["serde"] }
+time = { version = "0.3", features = ["serde", "serde-human-readable", "formatting", "parsing", "macros"] }
 
 # AWS
 aws-config = { version = "1", default-features = false, features = [

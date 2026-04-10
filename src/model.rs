@@ -1,7 +1,7 @@
-use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
 use std::collections::HashMap;
+use time::{Date, Month, OffsetDateTime};
 
 /// Maximum number of content/static pages shown in tables.
 pub const TOP_PAGES_LIMIT: usize = 15;
@@ -18,6 +18,27 @@ pub const MAX_SITEMAP_GAPS: usize = 15;
 /// Maximum number of referers shown in reports.
 pub const TOP_REFERERS_LIMIT: usize = 15;
 
+/// Split pages into (content_pages limited to TOP_PAGES_LIMIT, static_assets).
+pub fn split_pages(pages: &[PageHits]) -> (Vec<PageHits>, Vec<PageHits>) {
+    let content: Vec<PageHits> = pages
+        .iter()
+        .filter(|p| p.category == "page")
+        .take(TOP_PAGES_LIMIT)
+        .cloned()
+        .collect();
+    let statics: Vec<PageHits> = pages
+        .iter()
+        .filter(|p| p.category != "page")
+        .cloned()
+        .collect();
+    (content, statics)
+}
+
+/// Parse an ISO 8601 date string ("YYYY-MM-DD") into a `time::Date`.
+pub fn parse_date(s: &str) -> Option<Date> {
+    Date::parse(s, time::macros::format_description!("[year]-[month]-[day]")).ok()
+}
+
 /// Compute (human_pct, bot_pct) with proper f64 rounding.
 pub fn human_bot_pct(hits: u64, bot_hits: u64) -> (u64, u64) {
     if hits == 0 {
@@ -28,23 +49,65 @@ pub fn human_bot_pct(hits: u64, bot_hits: u64) -> (u64, u64) {
 }
 
 /// Return the last day of a given month.
-pub fn last_day_of_month(year: i32, month: u32) -> NaiveDate {
-    if month == 12 {
-        NaiveDate::from_ymd_opt(year + 1, 1, 1)
-            .unwrap()
-            .pred_opt()
-            .unwrap()
+pub fn last_day_of_month(year: i32, month: u32) -> Date {
+    let next = if month == 12 {
+        Date::from_calendar_date(year + 1, Month::January, 1).unwrap()
     } else {
-        NaiveDate::from_ymd_opt(year, month + 1, 1)
-            .unwrap()
-            .pred_opt()
-            .unwrap()
+        Date::from_calendar_date(year, Month::try_from(month as u8 + 1).unwrap(), 1).unwrap()
+    };
+    next.previous_day().unwrap()
+}
+
+/// Parse a "YYYY-MM" string into (year, month_number, first_day).
+pub fn parse_month(month: &str) -> anyhow::Result<(i32, u32, Date)> {
+    let parts: Vec<&str> = month.split('-').collect();
+    if parts.len() != 2 {
+        anyhow::bail!("Invalid month format '{}', expected YYYY-MM", month);
     }
+    let year: i32 = parts[0].parse()?;
+    let month_num: u32 = parts[1].parse()?;
+    let first_day = Date::from_calendar_date(year, Month::try_from(month_num as u8)?, 1)
+        .map_err(|e| anyhow::anyhow!("Invalid month '{}': {}", month, e))?;
+    Ok((year, month_num, first_day))
+}
+
+/// All dates in a month up to today.
+pub fn dates_in_month(month: &str) -> anyhow::Result<Vec<Date>> {
+    let (year, month_num, first) = parse_month(month)?;
+    let last = last_day_of_month(year, month_num);
+    let today = OffsetDateTime::now_utc().date();
+    let end = last.min(today);
+
+    let mut dates = Vec::new();
+    let mut d = first;
+    while d <= end {
+        dates.push(d);
+        d = d.next_day().unwrap();
+    }
+    Ok(dates)
+}
+
+/// All dates in a year up to today.
+pub fn dates_in_year(year: &str) -> anyhow::Result<Vec<Date>> {
+    let year_num: i32 = year.parse()?;
+    let today = OffsetDateTime::now_utc().date();
+    let max_month: u32 = if year_num == today.year() {
+        u8::from(today.month()) as u32
+    } else {
+        12
+    };
+
+    let mut dates = Vec::new();
+    for m in 1..=max_month {
+        let month_str = format!("{}-{:02}", year, m);
+        dates.extend(dates_in_month(&month_str)?);
+    }
+    Ok(dates)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DailyTraffic {
-    pub date: NaiveDate,
+    pub date: Date,
     pub hits: u64,
     pub visitors: u64,
 }
@@ -69,7 +132,7 @@ pub struct HourlyTraffic {
 pub struct CrawlerStats {
     pub bot_name: String,
     pub hits: u64,
-    pub last_crawl: Option<DateTime<Utc>>,
+    pub last_crawl: Option<OffsetDateTime>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,7 +161,7 @@ pub struct MonthReport {
 
 #[derive(Debug)]
 pub struct DayCache {
-    pub date: NaiveDate,
+    pub date: Date,
     pub hits: u64,
     pub visitors: u64,
     pub bot_hits: u64,
@@ -108,6 +171,84 @@ pub struct DayCache {
     pub bot_stats: Vec<CrawlerStats>,
     pub google_hits: HashMap<String, u64>,
     pub referer_stats: Vec<RefererStats>,
+}
+
+fn merge_page_rollup<'a>(sources: impl Iterator<Item = &'a Vec<PageHits>>) -> Vec<PageHits> {
+    let mut rollup: HashMap<(String, String), (u64, u64, u64)> = HashMap::new();
+    for pages in sources {
+        for p in pages {
+            let entry = rollup
+                .entry((p.category.clone(), p.path.clone()))
+                .or_default();
+            entry.0 += p.hits;
+            entry.1 += p.visitors;
+            entry.2 += p.bot_hits;
+        }
+    }
+    let mut result: Vec<PageHits> = rollup
+        .into_iter()
+        .map(|((category, path), (hits, visitors, bot_hits))| PageHits {
+            path,
+            hits,
+            visitors,
+            bot_hits,
+            category,
+        })
+        .collect();
+    result.sort_by_key(|p| Reverse(p.hits));
+    result
+}
+
+fn merge_bot_rollup<'a>(sources: impl Iterator<Item = &'a Vec<CrawlerStats>>) -> Vec<CrawlerStats> {
+    let mut rollup: HashMap<String, (u64, Option<OffsetDateTime>)> = HashMap::new();
+    for stats in sources {
+        for b in stats {
+            let entry = rollup.entry(b.bot_name.clone()).or_insert((0, None));
+            entry.0 += b.hits;
+            if b.last_crawl > entry.1 {
+                entry.1 = b.last_crawl;
+            }
+        }
+    }
+    let mut result: Vec<CrawlerStats> = rollup
+        .into_iter()
+        .map(|(bot_name, (hits, last_crawl))| CrawlerStats {
+            bot_name,
+            hits,
+            last_crawl,
+        })
+        .collect();
+    result.sort_by_key(|s| Reverse(s.hits));
+    result
+}
+
+fn merge_google_hits<'a>(
+    sources: impl Iterator<Item = &'a HashMap<String, u64>>,
+) -> HashMap<String, u64> {
+    let mut merged: HashMap<String, u64> = HashMap::new();
+    for map in sources {
+        for (path, hits) in map {
+            *merged.entry(path.clone()).or_default() += hits;
+        }
+    }
+    merged
+}
+
+fn merge_referer_rollup<'a>(
+    sources: impl Iterator<Item = &'a Vec<RefererStats>>,
+) -> Vec<RefererStats> {
+    let mut rollup: HashMap<String, u64> = HashMap::new();
+    for stats in sources {
+        for r in stats {
+            *rollup.entry(r.referer.clone()).or_default() += r.hits;
+        }
+    }
+    let mut result: Vec<RefererStats> = rollup
+        .into_iter()
+        .map(|(referer, hits)| RefererStats { referer, hits })
+        .collect();
+    result.sort_by_key(|r| Reverse(r.hits));
+    result
 }
 
 impl MonthReport {
@@ -133,77 +274,15 @@ impl MonthReport {
             })
             .collect();
 
-        // Merge top_pages by (category, path), summing hits/visitors/bot_hits
-        let mut page_rollup: HashMap<(String, String), (u64, u64, u64)> = HashMap::new();
-        for day in &days {
-            for p in &day.top_pages {
-                let entry = page_rollup
-                    .entry((p.category.clone(), p.path.clone()))
-                    .or_default();
-                entry.0 += p.hits;
-                entry.1 += p.visitors;
-                entry.2 += p.bot_hits;
-            }
-        }
-        let mut top_pages: Vec<PageHits> = page_rollup
-            .into_iter()
-            .map(|((category, path), (hits, visitors, bot_hits))| PageHits {
-                path,
-                hits,
-                visitors,
-                bot_hits,
-                category,
-            })
-            .collect();
-        top_pages.sort_by_key(|p| Reverse(p.hits));
+        let top_pages = merge_page_rollup(days.iter().map(|d| &d.top_pages));
+        let bot_stats = merge_bot_rollup(days.iter().map(|d| &d.bot_stats));
+        let google_hits = merge_google_hits(days.iter().map(|d| &d.google_hits));
+        let referer_stats = merge_referer_rollup(days.iter().map(|d| &d.referer_stats));
 
-        // Merge bot_stats by bot_name, sum hits, max last_crawl
-        let mut bot_rollup: HashMap<String, (u64, Option<DateTime<Utc>>)> = HashMap::new();
-        for day in &days {
-            for b in &day.bot_stats {
-                let entry = bot_rollup.entry(b.bot_name.clone()).or_insert((0, None));
-                entry.0 += b.hits;
-                if b.last_crawl > entry.1 {
-                    entry.1 = b.last_crawl;
-                }
-            }
-        }
-        let mut bot_stats: Vec<CrawlerStats> = bot_rollup
-            .into_iter()
-            .map(|(bot_name, (hits, last_crawl))| CrawlerStats {
-                bot_name,
-                hits,
-                last_crawl,
-            })
-            .collect();
-        bot_stats.sort_by_key(|s| Reverse(s.hits));
-
-        // Merge google_hits by path
-        let mut google_hits: HashMap<String, u64> = HashMap::new();
-        for day in &days {
-            for (path, hits) in &day.google_hits {
-                *google_hits.entry(path.clone()).or_default() += hits;
-            }
-        }
-
-        // Merge referer_stats across days
-        let mut referer_rollup: HashMap<String, u64> = HashMap::new();
-        for day in &days {
-            for r in &day.referer_stats {
-                *referer_rollup.entry(r.referer.clone()).or_default() += r.hits;
-            }
-        }
-        let mut referer_stats: Vec<RefererStats> = referer_rollup
-            .into_iter()
-            .map(|(referer, hits)| RefererStats { referer, hits })
-            .collect();
-        referer_stats.sort_by_key(|r| Reverse(r.hits));
-
-        // Build daily_pages and daily_hourly, consuming from DayCaches to avoid cloning
         let mut daily_pages: HashMap<String, Vec<PageHits>> = HashMap::new();
         let mut daily_hourly: HashMap<String, Vec<HourlyTraffic>> = HashMap::new();
         for day in &days {
-            let date_str = day.date.format("%Y-%m-%d").to_string();
+            let date_str = day.date.to_string();
             daily_pages.insert(date_str.clone(), day.top_pages.clone());
             daily_hourly.insert(date_str, day.hourly.clone());
         }
@@ -239,53 +318,6 @@ pub struct MonthlyTraffic {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct MonthSummary {
-    pub month: String,
-    pub total_hits: u64,
-    pub total_visitors: u64,
-    pub total_bot_hits: u64,
-    pub total_bot_visitors: u64,
-    pub daily: Vec<DailyTraffic>,
-    pub top_pages: Vec<PageHits>,
-    pub bot_stats: Vec<CrawlerStats>,
-    pub google_hits: HashMap<String, u64>,
-    pub referer_stats: Vec<RefererStats>,
-}
-
-impl MonthSummary {
-    pub fn from_month_report(report: &MonthReport, month: &str) -> Self {
-        MonthSummary {
-            month: month.to_string(),
-            total_hits: report.total_hits,
-            total_visitors: report.total_visitors,
-            total_bot_hits: report.total_bot_hits,
-            total_bot_visitors: report.total_bot_visitors,
-            daily: report
-                .daily
-                .iter()
-                .map(|d| DailyTraffic {
-                    date: d.date,
-                    hits: d.hits,
-                    visitors: d.visitors,
-                })
-                .collect(),
-            top_pages: report.top_pages.clone(),
-            bot_stats: report
-                .bot_stats
-                .iter()
-                .map(|b| CrawlerStats {
-                    bot_name: b.bot_name.clone(),
-                    hits: b.hits,
-                    last_crawl: b.last_crawl,
-                })
-                .collect(),
-            google_hits: report.google_hits.clone(),
-            referer_stats: report.referer_stats.clone(),
-        }
-    }
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 pub struct YearReport {
     pub year: String,
     pub total_hits: u64,
@@ -296,7 +328,6 @@ pub struct YearReport {
     pub top_pages: Vec<PageHits>,
     pub bot_stats: Vec<CrawlerStats>,
     pub google_hits: HashMap<String, u64>,
-    pub month_summaries: Vec<MonthSummary>,
     pub referer_stats: Vec<RefererStats>,
 }
 
@@ -319,77 +350,10 @@ impl YearReport {
             })
             .collect();
 
-        // Merge top_pages across months
-        let mut page_rollup: HashMap<(String, String), (u64, u64, u64)> = HashMap::new();
-        for (_, r) in &months {
-            for p in &r.top_pages {
-                let entry = page_rollup
-                    .entry((p.category.clone(), p.path.clone()))
-                    .or_default();
-                entry.0 += p.hits;
-                entry.1 += p.visitors;
-                entry.2 += p.bot_hits;
-            }
-        }
-        let mut top_pages: Vec<PageHits> = page_rollup
-            .into_iter()
-            .map(|((category, path), (hits, visitors, bot_hits))| PageHits {
-                path,
-                hits,
-                visitors,
-                bot_hits,
-                category,
-            })
-            .collect();
-        top_pages.sort_by_key(|p| Reverse(p.hits));
-
-        // Merge bot_stats across months
-        let mut bot_rollup: HashMap<String, (u64, Option<DateTime<Utc>>)> = HashMap::new();
-        for (_, r) in &months {
-            for b in &r.bot_stats {
-                let entry = bot_rollup.entry(b.bot_name.clone()).or_insert((0, None));
-                entry.0 += b.hits;
-                if b.last_crawl > entry.1 {
-                    entry.1 = b.last_crawl;
-                }
-            }
-        }
-        let mut bot_stats: Vec<CrawlerStats> = bot_rollup
-            .into_iter()
-            .map(|(bot_name, (hits, last_crawl))| CrawlerStats {
-                bot_name,
-                hits,
-                last_crawl,
-            })
-            .collect();
-        bot_stats.sort_by_key(|s| Reverse(s.hits));
-
-        // Merge google_hits across months
-        let mut google_hits: HashMap<String, u64> = HashMap::new();
-        for (_, r) in &months {
-            for (path, hits) in &r.google_hits {
-                *google_hits.entry(path.clone()).or_default() += hits;
-            }
-        }
-
-        // Merge referer_stats across months
-        let mut referer_rollup: HashMap<String, u64> = HashMap::new();
-        for (_, r) in &months {
-            for ref_stat in &r.referer_stats {
-                *referer_rollup.entry(ref_stat.referer.clone()).or_default() += ref_stat.hits;
-            }
-        }
-        let mut referer_stats: Vec<RefererStats> = referer_rollup
-            .into_iter()
-            .map(|(referer, hits)| RefererStats { referer, hits })
-            .collect();
-        referer_stats.sort_by_key(|r| Reverse(r.hits));
-
-        // Build month summaries
-        let month_summaries: Vec<MonthSummary> = months
-            .iter()
-            .map(|(m, r)| MonthSummary::from_month_report(r, m))
-            .collect();
+        let top_pages = merge_page_rollup(months.iter().map(|(_, r)| &r.top_pages));
+        let bot_stats = merge_bot_rollup(months.iter().map(|(_, r)| &r.bot_stats));
+        let google_hits = merge_google_hits(months.iter().map(|(_, r)| &r.google_hits));
+        let referer_stats = merge_referer_rollup(months.iter().map(|(_, r)| &r.referer_stats));
 
         YearReport {
             year: year.to_string(),
@@ -401,7 +365,6 @@ impl YearReport {
             top_pages,
             bot_stats,
             google_hits,
-            month_summaries,
             referer_stats,
         }
     }

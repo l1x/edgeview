@@ -3,15 +3,14 @@ use crate::pipeline::Timings;
 use crate::query::{list_s3_objects, S3_CONCURRENCY};
 use arrow::array::RecordBatch;
 use arrow::compute::{concat_batches, lexsort_to_indices, take, SortColumn, SortOptions};
-use chrono::{Datelike, NaiveDate, Utc};
 use futures::stream::{self, StreamExt, TryStreamExt};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ArrowWriter;
 use parquet::basic::Compression;
 use parquet::file::properties::WriterProperties;
 use std::sync::Arc;
+use time::{Date, OffsetDateTime};
 use tracing::{info, warn};
-use url::Url;
 
 /// Timeout for downloading a full S3 object (all 39 columns).
 const FULL_DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
@@ -42,7 +41,7 @@ struct CompactDayResult {
     skipped: bool,
 }
 
-fn compact_s3_prefix(raw_s3_path: &str) -> String {
+pub(crate) fn compact_s3_prefix(raw_s3_path: &str) -> String {
     let trimmed = raw_s3_path.trim_end_matches('/');
     if let Some(base) = trimmed.strip_suffix("/raw") {
         format!("{}/compact", base)
@@ -51,12 +50,12 @@ fn compact_s3_prefix(raw_s3_path: &str) -> String {
     }
 }
 
-fn compact_key(compact_prefix: &str, date: NaiveDate) -> String {
+pub(crate) fn compact_key(compact_prefix: &str, date: Date) -> String {
     format!(
         "{}/{}/{:02}/{:02}.parquet",
         compact_prefix,
         date.year(),
-        date.month(),
+        u8::from(date.month()),
         date.day()
     )
 }
@@ -84,13 +83,13 @@ async fn download_full_day(
     client: &aws_sdk_s3::Client,
     bucket: &str,
     s3_prefix: &str,
-    date: NaiveDate,
+    date: Date,
 ) -> anyhow::Result<(Vec<RecordBatch>, usize, u64)> {
     let prefix = format!(
         "{}/{}/{:02}/{:02}/",
         s3_prefix,
         date.year(),
-        date.month(),
+        u8::from(date.month()),
         date.day()
     );
     let objects = list_s3_objects(client, bucket, &prefix).await?;
@@ -215,7 +214,7 @@ async fn compact_day(
     bucket: &str,
     s3_prefix: &str,
     compact_prefix: &str,
-    date: NaiveDate,
+    date: Date,
     config: &CompactConfig,
 ) -> anyhow::Result<CompactDayResult> {
     let key = compact_key(compact_prefix, date);
@@ -272,9 +271,8 @@ async fn compact_day(
     let tmp_dir = tempfile::tempdir()?;
     let tmp_path = tmp_dir.path().join("compact.parquet");
     let compact_bytes = {
-        let sorted = sorted;
-        let tmp_path = tmp_path.clone();
-        tokio::task::spawn_blocking(move || write_compact_parquet(&sorted, &tmp_path)).await??
+        let tmp = tmp_path.clone();
+        tokio::task::spawn_blocking(move || write_compact_parquet(&sorted, &tmp)).await??
     };
 
     // Upload
@@ -304,17 +302,15 @@ async fn compact_day(
 pub async fn compact_site(
     s3_client: &aws_sdk_s3::Client,
     site: &SiteConfig,
-    dates: Vec<NaiveDate>,
+    dates: Vec<Date>,
     config: &CompactConfig,
     timings: &mut Timings,
 ) -> anyhow::Result<()> {
-    let s3_url = Url::parse(&site.s3_path)?;
-    let bucket = s3_url.host_str().unwrap_or_default().to_string();
-    let s3_prefix = s3_url.path().trim_start_matches('/').to_string();
+    let (bucket, s3_prefix) = site.s3_bucket_and_prefix()?;
     let compact_prefix = compact_s3_prefix(&s3_prefix);
 
-    let today = Utc::now().date_naive();
-    let dates: Vec<NaiveDate> = dates.into_iter().filter(|&d| d < today).collect();
+    let today = OffsetDateTime::now_utc().date();
+    let dates: Vec<Date> = dates.into_iter().filter(|&d| d < today).collect();
 
     if dates.is_empty() {
         warn!(domain = %site.domain, "No dates to compact (today is excluded)");
@@ -381,43 +377,40 @@ pub async fn compact_site(
     Ok(())
 }
 
-/// Generate all dates in a month up to yesterday.
-pub fn dates_in_month(month: &str) -> anyhow::Result<Vec<NaiveDate>> {
-    let parts: Vec<&str> = month.split('-').collect();
-    if parts.len() != 2 {
-        anyhow::bail!("Invalid month format '{}', expected YYYY-MM", month);
-    }
-    let year: i32 = parts[0].parse()?;
-    let month_num: u32 = parts[1].parse()?;
-    let first = NaiveDate::from_ymd_opt(year, month_num, 1)
-        .ok_or_else(|| anyhow::anyhow!("Invalid month: {}", month))?;
-    let last = crate::model::last_day_of_month(year, month_num);
-    let today = Utc::now().date_naive();
-    let end = if last < today { last } else { today };
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    let mut dates = Vec::new();
-    let mut d = first;
-    while d <= end {
-        dates.push(d);
-        d = d.succ_opt().unwrap();
+    #[test]
+    fn test_compact_s3_prefix_strips_raw() {
+        assert_eq!(compact_s3_prefix("dev.l1x.be/raw"), "dev.l1x.be/compact");
+        assert_eq!(compact_s3_prefix("dev.l1x.be/raw/"), "dev.l1x.be/compact");
     }
-    Ok(dates)
-}
 
-/// Generate all dates in a year up to yesterday.
-pub fn dates_in_year(year: &str) -> anyhow::Result<Vec<NaiveDate>> {
-    let year_num: i32 = year.parse()?;
-    let today = Utc::now().date_naive();
-    let max_month = if year_num == today.year() {
-        today.month()
-    } else {
-        12
-    };
-
-    let mut dates = Vec::new();
-    for m in 1..=max_month {
-        let month_str = format!("{}-{:02}", year, m);
-        dates.extend(dates_in_month(&month_str)?);
+    #[test]
+    fn test_compact_s3_prefix_appends_compact() {
+        assert_eq!(
+            compact_s3_prefix("dev.l1x.be/logs"),
+            "dev.l1x.be/logs/compact"
+        );
     }
-    Ok(dates)
+
+    #[test]
+    fn test_compact_key_format() {
+        let date = time::macros::date!(2026 - 03 - 01);
+        assert_eq!(
+            compact_key("dev.l1x.be/compact", date),
+            "dev.l1x.be/compact/2026/03/01.parquet"
+        );
+    }
+
+    #[test]
+    fn test_compact_key_round_trip() {
+        let date = time::macros::date!(2026 - 12 - 25);
+        let prefix = compact_s3_prefix("dev.l1x.be/raw");
+        assert_eq!(
+            compact_key(&prefix, date),
+            "dev.l1x.be/compact/2026/12/25.parquet"
+        );
+    }
 }

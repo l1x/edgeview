@@ -1,7 +1,6 @@
 use crate::model::{human_bot_pct, *};
 use crate::svg::theme::GREY_ORANGE;
 use crate::svg::SvgDoc;
-use chrono::{Datelike, NaiveDate};
 use std::collections::HashMap;
 
 /// Build a daily SVG matching the month view layout.
@@ -48,18 +47,7 @@ pub fn build_daily_svg(
 
     doc.add_hourly_traffic_section(hourly);
 
-    let content_pages: Vec<_> = pages
-        .iter()
-        .filter(|p| p.category == "page")
-        .take(TOP_PAGES_LIMIT)
-        .cloned()
-        .collect();
-    let static_assets: Vec<_> = pages
-        .iter()
-        .filter(|p| p.category != "page")
-        .cloned()
-        .collect();
-
+    let (content_pages, static_assets) = split_pages(pages);
     doc.add_top_content_pages(&content_pages);
     doc.add_static_assets(&static_assets);
     doc.add_bot_activity_section(bot_stats);
@@ -69,8 +57,10 @@ pub fn build_daily_svg(
 
 /// Format a date string like "2026-03-01" into a short tab label like "Mar 1".
 fn date_tab_label(date_str: &str) -> String {
-    if let Ok(d) = chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d") {
-        d.format("%b %-d").to_string()
+    use time::macros::format_description;
+    if let Some(d) = crate::model::parse_date(date_str) {
+        d.format(format_description!("[month repr:short] [day padding:none]"))
+            .unwrap_or_else(|_| date_str.to_string())
     } else {
         date_str.to_string()
     }
@@ -216,14 +206,19 @@ pub struct DayHtmlData {
     pub bot_hits: u64,
     pub pages: Vec<PageHits>,
     pub hourly: Vec<HourlyTraffic>,
-    pub bot_stats: Vec<CrawlerStats>,
-    pub referer_stats: Vec<RefererStats>,
 }
 
 /// Data for one month in the year report.
 pub struct MonthHtmlData {
     pub month: String, // "2026-03"
-    pub summary: MonthSummary,
+    pub total_hits: u64,
+    pub total_visitors: u64,
+    pub total_bot_hits: u64,
+    pub total_bot_visitors: u64,
+    pub daily: Vec<DailyTraffic>,
+    pub top_pages: Vec<PageHits>,
+    pub bot_stats: Vec<CrawlerStats>,
+    pub referer_stats: Vec<RefererStats>,
     pub days: Vec<DayHtmlData>,
 }
 
@@ -563,8 +558,8 @@ a:hover{text-decoration:underline}
             i
         ));
         let first_date_str = format!("{}-01", md.month);
-        let offset = NaiveDate::parse_from_str(&first_date_str, "%Y-%m-%d")
-            .map(|d| d.weekday().num_days_from_monday() as usize)
+        let offset = crate::model::parse_date(&first_date_str)
+            .map(|d| d.weekday().number_days_from_monday() as usize)
             .unwrap_or(0);
         for _ in 0..offset {
             html.push_str("<span class=\"cal-spacer\"></span>");
@@ -616,26 +611,13 @@ a:hover{text-decoration:underline}
             .collect();
         html.push_str(&card("Monthly Traffic", &render_bar_chart(&bars)));
 
-        let content_pages: Vec<PageHits> = year_report
-            .top_pages
-            .iter()
-            .filter(|p| p.category == "page")
-            .take(TOP_PAGES_LIMIT)
-            .cloned()
-            .collect();
+        let (content_pages, static_pages) = split_pages(&year_report.top_pages);
         if !content_pages.is_empty() {
             html.push_str(&card(
                 "Top Content",
                 &render_page_table(&content_pages, TOP_PAGES_LIMIT),
             ));
         }
-
-        let static_pages: Vec<PageHits> = year_report
-            .top_pages
-            .iter()
-            .filter(|p| p.category != "page")
-            .cloned()
-            .collect();
         if !static_pages.is_empty() {
             html.push_str(&render_grouped_static_cards(&static_pages));
         }
@@ -656,62 +638,48 @@ a:hover{text-decoration:underline}
     // Month panels
     for (i, md) in months.iter().enumerate() {
         html.push_str(&format!("<div class=\"panel\" id=\"panel-m{}\">\n", i));
-        let s = &md.summary;
-        let (hp, bp) = human_bot_pct(s.total_hits, s.total_bot_hits);
-        let (vhp, vbp) = human_bot_pct(s.total_visitors, s.total_bot_visitors);
+        let (hp, bp) = human_bot_pct(md.total_hits, md.total_bot_hits);
+        let (vhp, vbp) = human_bot_pct(md.total_visitors, md.total_bot_visitors);
         html.push_str(&render_kpi_cards(&[
             (
                 "Total Hits",
-                s.total_hits,
+                md.total_hits,
                 Some(format!("{hp}% human · {bp}% bot")),
             ),
             (
                 "Unique Visitors",
-                s.total_visitors,
+                md.total_visitors,
                 Some(format!("{vhp}% human · {vbp}% bot")),
             ),
-            ("Active Bots", s.bot_stats.len() as u64, None),
+            ("Active Bots", md.bot_stats.len() as u64, None),
         ]));
 
-        let bars: Vec<(String, u64)> = s
+        let bars: Vec<(String, u64)> = md
             .daily
             .iter()
-            .map(|d| (d.date.format("%-d").to_string(), d.hits))
+            .map(|d| (d.date.day().to_string(), d.hits))
             .collect();
         html.push_str(&card("Daily Traffic", &render_bar_chart(&bars)));
 
-        let content_pages: Vec<PageHits> = s
-            .top_pages
-            .iter()
-            .filter(|p| p.category == "page")
-            .take(TOP_PAGES_LIMIT)
-            .cloned()
-            .collect();
+        let (content_pages, static_pages) = split_pages(&md.top_pages);
         if !content_pages.is_empty() {
             html.push_str(&card(
                 "Top Content",
                 &render_page_table(&content_pages, TOP_PAGES_LIMIT),
             ));
         }
-
-        let static_pages: Vec<PageHits> = s
-            .top_pages
-            .iter()
-            .filter(|p| p.category != "page")
-            .cloned()
-            .collect();
         if !static_pages.is_empty() {
             html.push_str(&render_grouped_static_cards(&static_pages));
         }
 
         html.push_str(&card(
             "Bot Activity",
-            &render_bot_table(&s.bot_stats, TOP_BOTS_SVG_LIMIT),
+            &render_bot_table(&md.bot_stats, TOP_BOTS_SVG_LIMIT),
         ));
-        if !s.referer_stats.is_empty() {
+        if !md.referer_stats.is_empty() {
             html.push_str(&card(
                 "Top Referers",
-                &render_referer_table(&s.referer_stats, TOP_REFERERS_LIMIT),
+                &render_referer_table(&md.referer_stats, TOP_REFERERS_LIMIT),
             ));
         }
 
@@ -753,40 +721,21 @@ a:hover{text-decoration:underline}
                 .collect();
             html.push_str(&card("Hourly Traffic (UTC)", &render_bar_chart(&bars)));
 
-            let content_pages: Vec<PageHits> = day
-                .pages
-                .iter()
-                .filter(|p| p.category == "page")
-                .take(TOP_PAGES_LIMIT)
-                .cloned()
-                .collect();
+            let (content_pages, static_pages) = split_pages(&day.pages);
             if !content_pages.is_empty() {
                 html.push_str(&card(
                     "Top Content",
                     &render_page_table(&content_pages, TOP_PAGES_LIMIT),
                 ));
             }
-
-            let static_pages: Vec<PageHits> = day
-                .pages
-                .iter()
-                .filter(|p| p.category != "page")
-                .cloned()
-                .collect();
             if !static_pages.is_empty() {
                 html.push_str(&render_grouped_static_cards(&static_pages));
             }
 
             html.push_str(&card(
                 "Bot Activity",
-                &render_bot_table(&day.bot_stats, TOP_BOTS_SVG_LIMIT),
+                &render_bot_table(&md.bot_stats, TOP_BOTS_SVG_LIMIT),
             ));
-            if !day.referer_stats.is_empty() {
-                html.push_str(&card(
-                    "Top Referers",
-                    &render_referer_table(&day.referer_stats, TOP_REFERERS_LIMIT),
-                ));
-            }
             html.push_str("</div>\n");
         }
     }

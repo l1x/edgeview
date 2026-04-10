@@ -63,7 +63,7 @@ impl SvgDoc {
             ));
 
             // Date label below bar
-            let label = t.date.format("%-d").to_string();
+            let label = t.date.day().to_string();
             let label_x = x + bar_width / 2.0;
             let label_y = self.y_cursor + chart_height + 16.0;
             self.content.push_str(&format!(

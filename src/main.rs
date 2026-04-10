@@ -162,10 +162,7 @@ async fn make_s3_client(
     let s3_client = aws_sdk_s3::Client::from_conf(s3_config);
 
     // Validate credentials
-    let s3_url = url::Url::parse(&sites[0].s3_path)
-        .map_err(|e| anyhow::anyhow!("Invalid s3_path '{}': {}", sites[0].s3_path, e))?;
-    let bucket = s3_url.host_str().unwrap();
-    let prefix = s3_url.path().trim_start_matches('/');
+    let (bucket, prefix) = sites[0].s3_bucket_and_prefix()?;
     s3_client
         .list_objects_v2()
         .bucket(bucket)
@@ -253,9 +250,9 @@ async fn run_compact(cmd: CompactArgs, config: &config::Config) -> anyhow::Resul
 
     for site in sites {
         let dates = if let Some(year) = &cmd.year {
-            compact::dates_in_year(year)?
+            model::dates_in_year(year)?
         } else if let Some(month) = &cmd.month {
-            compact::dates_in_month(month)?
+            model::dates_in_month(month)?
         } else {
             unreachable!()
         };
